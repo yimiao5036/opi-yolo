@@ -164,7 +164,7 @@ class DroneDetector:
 
 
 if __name__ == "__main__":
-    MODEL_PATH = "./om/yolo26n.om"
+    MODEL_PATH = "./om/yolo26n-drone.om"
     SERIAL_PORT = "/dev/ttyAMA0"  # 根据实际修改
     BAUD = 57600
 
