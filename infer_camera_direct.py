@@ -5,7 +5,7 @@ import time
 from ais_bench.infer.interface import InferSession
 
 # ==================== 硬编码配置区域 ====================
-MODEL_PATH = "./yolo26_8t.om"  # 你的 YOLO26 模型路径
+MODEL_PATH = "./om/yolo26n-balloon.om"  # 你的 YOLO26 模型路径
 CONF_THRESHOLD = 0.25  # 置信度过滤阈值 (YOLO26 推荐 0.25)
 CAMERA_INDEX = 0  # 摄像头索引 (默认0，如果打不开可以尝试1或2)
 
