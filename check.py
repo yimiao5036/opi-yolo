@@ -1,7 +1,10 @@
+# ===================================
+#           查看视频的帧率等属性
+# ===================================
 import cv2
 import os
 
-video_path = "./output_result.mp4"  # 替换成你上传的视频文件名
+video_path = "saved_video/output_result.mp4"  # 替换成你上传的视频文件名
 
 if not os.path.exists(video_path):
     print(f"错误：找不到文件 {video_path}")
@@ -34,9 +37,9 @@ print(f"视频总帧数: {int(total_frames)} 帧")
 print(f"视频总时长: {duration:.2f} 秒")
 print("==========================================")
 
-if fps <= 25.5:
-    print("💡 结论：不出所料，你的视频本身就被录制/压制成了 25 帧！")
-    print("OpenCV 的 cap.read() 会卡在 25fps 的播放速度上等下一帧，导致 NPU 闲置。")
-    print("你想测试 NPU 的真实上限，需要用前面提到的『纯随机数矩阵压测脚本』。")
+# if fps <= 25.5:
+#     print("💡 结论：不出所料，你的视频本身就被录制/压制成了 25 帧！")
+#     print("OpenCV 的 cap.read() 会卡在 25fps 的播放速度上等下一帧，导致 NPU 闲置。")
+#     print("你想测试 NPU 的真实上限，需要用前面提到的『纯随机数矩阵压测脚本』。")
 
 cap.release()
