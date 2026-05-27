@@ -7,15 +7,15 @@ import queue
 import socket
 from ais_bench.infer.interface import InferSession
 
-# ==================== 配置区域 ====================
-MODEL_PATH = "./om/yolo26n-balloon.om"  # YOLO26 模型路径
-INPUT_VIDEO = "./test_video.mp4"  # 输入的测试视频（或 0 代表摄像头）
-CONF_THRESHOLD = 0.25  # 置信度阈值
+# ==================== 配置区域 ======================
+MODEL_PATH = "./om/yolo26n-balloon.om"          # YOLO26 模型路径
+INPUT_VIDEO = "./test_video.mp4"                # 输入的测试视频（或 0 代表摄像头）
+CONF_THRESHOLD = 0.25                           # 置信度阈值
 
 # -------------- 无线图传网络配置 --------------
-GROUND_STATION_IP = "192.168.31.239"  # 地面站的局域网 IP
+GROUND_STATION_IP = "192.168.31.239"            # 地面站的局域网 IP
 UDP_PORT = 9999
-JPEG_QUALITY = 75  # JPEG 压缩质量 (0-100)
+JPEG_QUALITY = 75                               # JPEG 压缩质量 (0-100)
 # ==================================================
 
 # 限制队列大小，发不完就直接丢帧，保证飞控算法实时性
@@ -108,6 +108,14 @@ def main():
     detector = YOLO26UAVInfer(MODEL_PATH)
     cap = cv2.VideoCapture(INPUT_VIDEO)
 
+    from control import UAVController
+
+    # 初始化飞控通信类 (后续需根据实际串口修改, 这里临时选用 /dev/ttyUSB0代替)
+    uav_controller = UAVController(port='/dev/ttyUSB0', baud=115200)
+
+    # 控制总开关: 只有当人在地面发送允许指令才会开启 AI 追踪
+    AI_CONTROL_ENABLE = False
+
     if not cap.isOpened():
         print("❌ 无法打开视频源")
         return
@@ -122,7 +130,7 @@ def main():
         if not ret:
             break
 
-        # 【核心修正】完全保留读取到的原图大小，坚决不在这一步进行 cv2.resize！
+        # 完全保留读取到的原图大小
         orig_shape = frame.shape[:2]
         img_center_x = orig_shape[1] / 2
         img_center_y = orig_shape[0] / 2
