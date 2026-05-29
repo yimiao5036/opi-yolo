@@ -9,7 +9,7 @@ from ais_bench.infer.interface import InferSession
 
 # ==================== 配置区域 ======================
 MODEL_PATH = "./om/yolo26n-balloon.om"          # YOLO26 模型路径
-INPUT_VIDEO = 0                                 # 摄像头编号
+INPUT_VIDEO = "./test_video.mp4"                # 输入的测试视频
 CONF_THRESHOLD = 0.25                           # 置信度阈值
 
 # -------------- 无线图传网络配置 --------------
