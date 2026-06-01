@@ -7,7 +7,13 @@ import queue
 import socket
 from ais_bench.infer.interface import InferSession
 
+# ================== 导入控制模块 =====================
+from drone_controller.base_control import DroneController
+from drone_controller.pid_counter import PID
+# ===================================================
+
 # ==================== 配置区域 ======================
+# -------------- 模型部分基本配置 --------------
 MODEL_PATH = "./om/yolo26n-balloon.om"          # YOLO26 模型路径
 INPUT_VIDEO = 0                                 # 摄像头编号
 CONF_THRESHOLD = 0.25                           # 置信度阈值
@@ -16,6 +22,10 @@ CONF_THRESHOLD = 0.25                           # 置信度阈值
 GROUND_STATION_IP = "192.168.31.239"            # 地面站的局域网 IP
 UDP_PORT = 9999
 JPEG_QUALITY = 75                               # JPEG 压缩质量 (0-100)
+
+# -------------- 串口数据信息配置 --------------
+connection_string = '/dev/ttyUSB0'
+baud_rate = 57600
 # ==================================================
 
 # 限制队列大小，发不完就直接丢帧，保证飞控算法实时性
@@ -107,9 +117,16 @@ def draw_boxes(img, detections):
 def main():
     detector = YOLO26UAVInfer(MODEL_PATH)
     cap = cv2.VideoCapture(INPUT_VIDEO)
-    from control import UAVController
 
-    uav = UAVController()
+    uav = DroneController(connection_string=connection_string, baud=baud_rate)
+    uav.connect()
+
+    if not uav.is_armed & uav.current_mode not in ['GUIDED', 'OFFBOARD']:
+        uav.arm()
+
+    # 初始化Y轴 (左右方向) 和Z轴 (上下方向) 的 PID 调节器
+    pid_y = PID(kp=1.0, ki=0.02, kd=0.3, max_out=0.8, min_out=-0.8)
+    pid_z = PID(kp=1.0, ki=0.02, kd=0.3, max_out=0.4, min_out=-0.4)
 
     if not cap.isOpened():
         print("❌ 无法打开视频源")
@@ -156,17 +173,35 @@ def main():
             err_x = (target_x - img_center_x) / img_center_x
             err_y = (target_y - img_center_y) / img_center_y
 
+            # 数学层：将图像误差转化为物理速度需求值
+            # 注意：图像X方向偏右（err_x > 0），飞机应当向右飞（机体 Vy 为正）
+            vy_cmd = pid_y.update(err_x)
+            # 注意：图像Y方向偏下（err_y > 0），飞机应该向下运动对齐（机体 Vz 在NED系下向下为正）
+            vz_cmd = pid_z.update(err_y)
+
+            # 保持前后方向 (Vx) 的固定推进距离或由其他策略决定，此处设为0（仅上下左右平移对准）
+            vx_cmd = 0.0
+
             # 画中心对准线
             cv2.line(frame, (int(img_center_x), int(img_center_y)), (int(target_x), int(target_y)), (255, 0, 0), 2)
             cv2.putText(frame, f"MAVLink Out -> Err_X: {err_x:+.3f} Err_Y: {err_y:+.3f}", (20, 70),cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             # ================ MAVLink 动作调用 =================
-            uav.update_control(has_target=True, err_x=err_x, err_y=err_y)
+            if getattr(uav, 'current_mode', None) in ['GUIDED', 'OFFBOARD']:
+                uav.send_body_velocity(vx=vx_cmd, vy=vy_cmd, vz=vz_cmd, yaw_rate=0.0)
+            else:
+                cv2.putText(frame, f"MANUAL MODE OVERRIDE ({uav.current_mode})", (20, 100), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (0, 0, 255), 2)
             # =================================================
         else:
             cv2.putText(frame, "MAVLink Out -> Target LOST (HOVER)", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 0, 255), 2)
             # ================ MAVLink 丢失保护 =================
-            uav.update_control(has_target=False)
+            # 清除 PID 历史积分状态，防止下次捕捉目标时突跳炸机
+            if hasattr(pid_y, 'reset'):pid_y.reset()
+            if hasattr(pid_z, 'reset'):pid_z.reset()
+
+            if getattr(uav, 'current_mode', None) in ['GUIDED', 'OFFBOARD']:
+                uav.send_body_velocity(vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0)
             # =================================================
 
         # 5. 在原始分辨率大图上，渲染精准目标框
