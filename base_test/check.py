@@ -4,7 +4,7 @@
 import cv2
 import os
 
-video_path = "asset/saved_video/output_result.mp4"  # 替换成你上传的视频文件名
+video_path = "../asset/saved_video/output_result.mp4"  # 替换成你上传的视频文件名
 
 if not os.path.exists(video_path):
     print(f"错误：找不到文件 {video_path}")
