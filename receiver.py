@@ -8,7 +8,7 @@ import os
 
 # ==================== 地面站核心配置 ====================
 PORT = 9999
-SAVE_DIR = "./saved_video"
+SAVE_DIR = "./asset/saved_video"
 SAVE_PATH = os.path.join(SAVE_DIR, "ground_station_record.mp4")
 RECORD_FPS = 24.0  # 录像固定的标准帧率
 # =======================================================

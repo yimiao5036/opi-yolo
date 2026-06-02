@@ -170,9 +170,51 @@ class DroneController:
             end="", flush=True
         )
 
+    def takeoff(self, altitude):
+        """发送起飞指令(仅在 GUIDED 或 OFFBOARD 模式下有效)"""
+        if not self.is_connected: return False
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0, 0, 0, 0, 0, 0, 0, altitude
+        )
+        print(f"已下发自动起飞指令 -> 目标高度: {altitude} 米")
+        return True
+
+    def send_target_position(self, x, y, z, yaw):
+        """
+        发送绝对局部位置( NED 坐标系)
+        x:北向目标位置
+        y:东向目标位置
+        z:垂直目标位置
+        """
+        if not self.is_connected: return
+        # 当人为切出切换模式时，香橙派不再发送命令
+        if self.current_mode not in ['GUIDED', 'OFFBOARD']: return
+
+        # 使用局部 NED 坐标系
+        coordinate_frame = mavutil.mavlink.MAV_FRAME_NED
+
+        # 掩码屏蔽:只保留位置 (x, y, z) 和偏航角 (yaw)
+        type_mask = 0b0000101111111000
+
+        self.master.mav.set_position_target_local_ned_send(
+            0,
+            self.master.target_system,
+            self.master.target_component,
+            coordinate_frame,
+            type_mask,
+            x, y, z,
+            0, 0, 0,
+            0, 0, 0,
+            math.radians(yaw),
+            0
+        )
+
     def close(self):
         """释放线程，关闭串口连接"""
         self.running = False
         if self.telemetry_thread:
-            self.telemetry_thread.join(timeout=1)
+            self.telemetry_thread.join(timeout=1.0)
         print("\n底层控制接口已安全断开。")

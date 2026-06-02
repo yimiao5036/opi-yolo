@@ -1,0 +1,33 @@
+{
+    "model": {
+        "model_path": "./om/yolo26n-balloon.om",
+        "conf_threshold": 0.25,
+        "device_id": 0
+    },
+    "video": {
+        "video_source": 0,
+        "jpeg_quality": 75
+    },
+    "network": {
+        "ground_station_ip": "192.168.31.239",
+        "udp_port": 9999
+    },
+    "flight_control": {
+        "connection_string": "/dev/ttyUSB0",
+        "baud_rate": 57600
+    },
+    "pid_y": {
+        "kp": 1.0,
+        "ki": 0.02,
+        "kd": 0.3,
+        "max_out": 0.8,
+        "min_out": -0.8
+    },
+    "pid_z": {
+        "kp": 1.0,
+        "ki": 0.02,
+        "kd": 0.3,
+        "max_out": 0.4,
+        "min_out": -0.4
+    }
+}
