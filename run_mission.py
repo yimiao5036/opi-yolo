@@ -1,4 +1,3 @@
-# run_mission.py
 import time
 from drone_controller.base_control import DroneController
 from drone_controller.mission_manager import MissionManager

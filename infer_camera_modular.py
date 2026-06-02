@@ -226,10 +226,10 @@ class UAVControlLoop:
 
 # ==================== 主程序入口 ======================
 def main():
-    # 默认加载同目录下的 uav_config.json
-    config_file = "uav_config.json"
+    # 默认加载同目录下的 config.json
+    config_file = "config.json"
 
-    # 进阶功能：允许在命令行指定 json 路径，例如: python3 infer_camera_modular.py config_outdoor.json
+    # 允许在命令行指定 json 路径，例如: python3 infer_camera_modular.py config_outdoor.json
     if len(sys.argv) > 1:
         config_file = sys.argv[1]
 
