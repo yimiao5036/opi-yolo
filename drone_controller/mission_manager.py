@@ -4,142 +4,183 @@ from enum import Enum
 
 
 class MissionState(Enum):
-    INIT = 0        # 初始化/等待连接
-    ARMING = 1      # 解锁中
-    TAKEOFF = 2     # 自动起飞中
+    INIT = 0        # 初始化/流式发送指令准备中
+    ARMING = 1      # 模式切换与解锁中
+    TAKEOFF = 2     # 自动起飞中（虚拟航点导航起飞）
     NAVIGATING = 3  # 航点巡航导航
-    HOLD_TASK = 4   # 到达航点后的原地任务悬停
-    RETURNING = 5   # 返航或直接准备降落
+    HOLD_TASK = 4   # 到达航点后的原地任务悬停检测
+    RETURNING = 5   # 任务完成，准备切换降落
     LANDING = 6     # 自动降落中
-    FINISHED = 7    # 任务结束/已上锁
+    FINISHED = 7    # 任务结束/已上锁退出
+
+
+class FailsafeTriggered(Exception):
+    """自定义安全异常：当安全员人工介入切出自控模式时抛出，用于暴力熔断主循环"""
+    pass
 
 
 class MissionManager:
-    def __init__(self, drone, waypoints, target_altitude=1.5, arrival_radius=0.3, hold_duration=5.0):
+    def __init__(self, drone, waypoints, target_altitude=1.5, arrival_radius=0.3, hold_duration=5.0, return_home=True):
         """
+        专为 PX4 固件优化的自动巡点状态机管理器
         :param drone: 实例化的 DroneController 底层驱动对象
         :param waypoints: 航点列表，格式为 [{'x': 1.0, 'y': 2.0, 'z': -1.5, 'yaw': 0}, ...]
-                          注意：NED 坐标系中，Z轴向上为负，所以起飞或目标高度应为负值
+                          注意：NED 坐标系中，Z轴向下为负，所以起飞或目标高度输入正数，内部会自动转为NED负值
         :param target_altitude: 初始起飞高度（米，正数，内部会自动转为NED负值）
         :param arrival_radius: 判定航点到达的三维欧氏距离阈值（米）
-        :param hold_duration: 在每个航点到达后，执行任务（或悬停）的停留时间（秒）
+        :param hold_duration: 在每个航点到达后，原地执行悬停/任务的停留时间（秒）
         """
         self.drone = drone
         self.waypoints = waypoints
         self.target_altitude = -abs(target_altitude)  # 强制转为 NED 坐标系的负高度
         self.arrival_radius = arrival_radius
         self.hold_duration = hold_duration
+        self.return_home = return_home
 
         self.state = MissionState.INIT
         self.current_wp_index = 0
         self.hold_start_time = None
 
+        # 链路活性流式计数器：确保以固定频率下发心跳期望（防PX4失控刹车）
+        self.last_send_time = 0.0
+        self.send_interval = 0.2  # 0.2秒对应 5Hz 下发频率
+
     def calculate_distance(self, target_x, target_y, target_z):
-        """计算无人机当前局部位置与目标点之间的三维欧氏距离"""
-        dx = target_x - self.drone.local_x
-        dy = target_y - self.drone.local_y
-        dz = target_z - self.drone.local_z
+        """计算无人机当前局部局部位置（来自飞控 LOCAL_POSITION_NED 遥测）与目标的欧氏距离"""
+        curr_x, curr_y, curr_z = self.drone.local_position
+        dx = target_x - curr_x
+        dy = target_y - curr_y
+        dz = target_z - curr_z
         return math.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+
+    def _stream_target_position(self, x, y, z, yaw):
+        """维持 PX4 OFFBOARD 模式所需的流式位置期望下发（限制 5Hz 频率）"""
+        now = time.time()
+        if now - self.last_send_time >= self.send_interval:
+            # 假设你的底层 base_control.py 中有 send_target_position 接口
+            self.drone.send_target_position(x, y, z, yaw)
+            self.last_send_time = now
 
     def update(self):
         """
         核心状态机轮询函数。
-        高层主循环高频调用此函数，根据当前状态驱动飞行任务。
+        高层主循环（如主循环 10Hz）必须不间断调用此函数驱动飞行任务。
+        一旦检测到人肉介入，直接抛出 FailsafeTriggered 异常终止运行。
         """
-        # 安全人肉兜底：如果安全员从遥控器切出 GUIDED 模式，状态机挂起，不执行任何行为
-        if self.state not in [MissionState.INIT, MissionState.ARMING]:
-            if self.drone.current_mode not in ['GUIDED', 'OFFBOARD']:
-                print(f"\r\n⚠️  [警告] 安全员切出控制模式！当前模式为: {self.drone.current_mode}, 任务管理程序挂起...", end="")
-                return False
+        # ==================== 1. 安全人肉熔断机制 ====================
+        if self.state not in [MissionState.INIT, MissionState.ARMING, MissionState.FINISHED]:
+            if self.drone.current_mode != 'OFFBOARD':
+                print(f"\n🚨 [熔断保护] 检测到飞控退出自控模式！当前模式为: {self.drone.current_mode}")
+                print("🚨 任务管理器瞬间拉断，上位机停止发送所有控制流，完全交由安全员接管！")
+                raise FailsafeTriggered("安全员强行越权接管，自控流程熔断")
 
-        # ----------------- 状态机逻辑 -----------------
+        # ==================== 2. 状态机业务分支 ====================
+
+        # --- STATE: INIT ---
         if self.state == MissionState.INIT:
             if self.drone.is_connected:
-                print("\n[状态] 飞控通信已建立，准备切换至 OFFBOARD 模式并解锁...")
-                if self.drone.set_mode('OFFBOARD'):   #若为 PX4 则是OFFBOARD; ArduPilot 则为 GUIDED
-                    self.state = MissionState.ARMING
-            else:
-                print("\r[状态] 等待飞控心跳包连接...", end="", flush=True)
+                # PX4 要求：在切入 OFFBOARD 模式之前，上位机必须已经开始流式下发位置/速度期望包，
+                # 否则飞控会拒绝切换模式。此处我们在原位流式灌入当前局部坐标作为活性维持。
+                cx, cy, cz = self.drone.local_position
+                self._stream_target_position(cx, cy, cz, self.drone.yaw)
 
+                print("\n[状态] 飞控通信正常，正在向 PX4 流式下发原位期望以激活控制链路...")
+                print("[动作] 正在向飞控请求切换至 OFFBOARD 模式并解锁...")
+
+                if self.drone.set_mode('OFFBOARD'):
+                    # 假设底层接口 drone.arm() 会发送解锁包并等待确认
+                    if self.drone.arm():
+                        self.state = MissionState.ARMING
+            else:
+                print("\r[状态] 等待飞控 MAVLink 串口通信建立...", end="", flush=True)
+
+        # --- STATE: ARMING ---
         elif self.state == MissionState.ARMING:
-            print("[状态] 正在发送解锁指令...")
-            if self.drone.arm():
-                print("[成功] 飞控解锁成功，正在下发自动起飞指令...")
-                # 转换到起飞高度，注意发送的是相对高度或绝对位置
-                if self.drone.takeoff(abs(self.target_altitude)):
-                    self.state = MissionState.TAKEOFF
-            else:
-                print("[重试] 解锁未被飞控确认，1秒后重新尝试解锁...")
-                time.sleep(1)
+            # 持续流式下发当前点，防模式闪退
+            cx, cy, cz = self.drone.local_position
+            self._stream_target_position(cx, cy, cz, self.drone.yaw)
 
+            if self.drone.is_armed and self.drone.current_mode == 'OFFBOARD':
+                print("\n[成功] 飞控已成功解锁，且处于 OFFBOARD 模式。开始执行平滑虚拟起飞流程...")
+                self.state = MissionState.TAKEOFF
+
+        # --- STATE: TAKEOFF (虚拟航点平滑起飞) ---
         elif self.state == MissionState.TAKEOFF:
-            # 判定起飞是否到达指定高度（NED 坐标系下，比较 z 值）
-            dist_to_takeoff = abs(self.drone.local_z - self.target_altitude)
-            print(
-                f"\r[起飞中] 当前高度: {-self.drone.local_z:.2f}M -> 目标: {abs(self.target_altitude)}M | 误差: {dist_to_takeoff:.2f}M",
-                end="", flush=True)
+            # PX4 泛用性最强的起飞：发送原地 (0, 0) 坐标，配合目标负高度值
+            self._stream_target_position(0.0, 0.0, self.target_altitude, 0.0)
 
-            if dist_to_takeoff <= self.arrival_radius:
-                print(f"\n[成功] 已到达起飞高度！开始执行巡点导航，共有 {len(self.waypoints)} 个航点。")
-                if len(self.waypoints) > 0:
-                    self.current_wp_index = 0
-                    self.state = MissionState.NAVIGATING
-                else:
-                    self.state = MissionState.RETURNING
+            # 计算距离起飞航点的距离
+            dist = self.calculate_distance(0.0, 0.0, self.target_altitude)
+            print(f"\r[起飞中] 目标高度: {-self.target_altitude:.2f}m | 当前距离起飞点: {dist:.2f}m", end="",
+                  flush=True)
 
+            if dist <= self.arrival_radius:
+                print(f"\n[完成] 虚拟起飞安全到达目标高度！开始按顺序巡航。总计航点数: {len(self.waypoints)}")
+                self.current_wp_index = 0
+                self.state = MissionState.NAVIGATING
+
+        # --- STATE: NAVIGATING (航点巡航导航) ---
         elif self.state == MissionState.NAVIGATING:
             wp = self.waypoints[self.current_wp_index]
-            # 持续高频向飞控下发当前期望航点
-            self.drone.send_target_position(wp['x'], wp['y'], wp['z'], wp['yaw'])
+            # 流式下发当前期望的绝对 NED 坐标与偏航角（激活PX4控制环并防止失控刹车）
+            self._stream_target_position(wp['x'], wp['y'], wp['z'], wp['yaw'])
 
-            # 计算距离
             dist = self.calculate_distance(wp['x'], wp['y'], wp['z'])
             print(
-                f"\r[巡航中] 正在飞往航点 [{self.current_wp_index + 1}]: 目标({wp['x']}, {wp['y']}, {wp['z']}) | 剩余距离: {dist:.2f}米",
+                f"\r[巡航中] 正在前往航点 [{self.current_wp_index + 1}/{len(self.waypoints)}] | 剩余距离: {dist:.2f}m",
                 end="", flush=True)
 
-            # 到达判定
             if dist <= self.arrival_radius:
-                print(f"\n[到达] 已成功到达航点 [{self.current_wp_index + 1}]！开始悬停执行特定任务...")
+                print(f"\n[到达] 成功进入航点 [{self.current_wp_index + 1}] 容差圈！开始执行就地悬停任务...")
                 self.hold_start_time = time.time()
                 self.state = MissionState.HOLD_TASK
 
+        # --- STATE: HOLD_TASK (到达航点后的原地任务悬停/拍照) ---
         elif self.state == MissionState.HOLD_TASK:
             wp = self.waypoints[self.current_wp_index]
-            # 悬停期间依然要持续发点，保持飞机锁死在原位
-            self.drone.send_target_position(wp['x'], wp['y'], wp['z'], wp['yaw'])
+            # 即使在原地停留/拍照，上位机也绝对不能“闭嘴”，必须以 5Hz 持续锁定该点坐标
+            self._stream_target_position(wp['x'], wp['y'], wp['z'], wp['yaw'])
 
             elapsed = time.time() - self.hold_start_time
             print(
-                f"\r[任务中] 航点 [{self.current_wp_index + 1}] 原地悬停检测中... 已耗时: {elapsed:.1f}s / {self.hold_duration}s",
+                f"\r[任务中] 航点 [{self.current_wp_index + 1}] 原地执行中... 已耗时: {elapsed:.1f}s / {self.hold_duration}s",
                 end="", flush=True)
 
             if elapsed >= self.hold_duration:
-                print(f"\n[完成] 航点 [{self.current_wp_index + 1}] 任务执行完毕。")
-                # 切换下一个点
+                print(f"\n[完成] 航点 [{self.current_wp_index + 1}] 停留时间结束。")
                 self.current_wp_index += 1
+
                 if self.current_wp_index < len(self.waypoints):
                     self.state = MissionState.NAVIGATING
                 else:
-                    print("\n[完成] 所有航点均已巡视完毕！准备返航/降落。")
+                    print("\n[巡视完毕] 所有计划航点均已完成！准备进入返航/降落切换阶段。")
+                    if self.return_home:
+                        self.state = MissionState.RETURNING
                     self.state = MissionState.RETURNING
 
+        # --- STATE: RETURNING ---
         elif self.state == MissionState.RETURNING:
-            print("\n[降落中] 正在下发自动降落指令 (LAND)...")
-            if self.drone.set_mode('LAND'):
+            # 持续发送当前点维持链路
+            cx, cy, cz = self.drone.local_position
+            self._stream_target_position(cx, cy, cz, self.drone.yaw)
+
+            print("\n[降落中] 正在向 PX4 下发自动降落指令 (AUTO.LAND)...")
+            # 提示：PX4 固件的标准降落模式名称通常为 'AUTO.LAND' 或 'LAND'，依底层驱动映射而定
+            if self.drone.set_mode('AUTO.LAND') or self.drone.set_mode('LAND'):
                 self.state = MissionState.LANDING
             else:
-                print("⚠️ 降落模式切换失败，正在重新下发...")
+                print("⚠️ 切换降落模式失败，正在高频重试...")
 
+        # --- STATE: LANDING ---
         elif self.state == MissionState.LANDING:
-            # 判断是否已经安全着陆并自动上锁
+            # 进入飞控原生 LAND 模式后，控制权已交还给飞控底层，此时上位机可以安全停止控制包输出了。
+            print("\r[降落中] 正在等待飞控触地并自动上锁...", end="", flush=True)
             if not self.drone.is_armed:
-                print("\n[成功] 检测到无人机已安全着陆并自动上锁。任务圆满结束！")
+                print("\n[完成] 无人机已安全着陆并自动锁桨！任务圆满结束。")
                 self.state = MissionState.FINISHED
-            else:
-                print(f"\r[降落中] 正在着陆... 当前高度: {-self.drone.local_z:.2f}M", end="", flush=True)
 
+        # --- STATE: FINISHED ---
         elif self.state == MissionState.FINISHED:
-            return True  # 任务全部结束
+            return True
 
         return False
