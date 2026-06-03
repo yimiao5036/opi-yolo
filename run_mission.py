@@ -1,58 +1,47 @@
 import time
 from drone_controller.base_control import DroneController
-from drone_controller.mission_manager import MissionManager
+from drone_controller.mission_manager import MissionManager, FailsafeTriggered
+
+# 1. 定义室内台架或室内试验场的相对局部航点 (X=北, Y=东, Z=地, yaw=偏航角)
+# 注意：NED 坐标系下，Z轴向上为负数！
+flight_waypoints = [
+    {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},  # 航点 1：向前 1 米，维持高度 1.5 米
+    {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},  # 航点 2：向右平移 1 米，机头转向正东
+    {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},  # 航点 3：回到原点上方，高度降到 1.2 米
+]
+
 
 def main():
-    # 1. 实例化飞控底层驱动 SDK
-    # 注意：根据现场情况修改你的串口和波特率
-    drone = DroneController(connection_string='/dev/ttyUSB0', baud=115200)
-    
+    # 2. 初始化底层 SDK 驱动
+    uav = DroneController(connection_string='/dev/ttyUSB0', baud=115200)
+    if not uav.connect():
+        print("物理串口打开失败，请检查数传连接或端口权限。")
+        return
+
+    # 3. 实例化任务管理器 (设置到达半径为0.3米，每个点悬停3秒)
+    manager = MissionManager(drone=uav, waypoints=flight_waypoints, target_altitude=1.5, arrival_radius=0.3,
+                             hold_duration=3.0)
+
+    print("=================== 巡航控制系统启动 ===================")
     try:
-        # 启动底层数据链连接与异步状态遥测线程
-        drone.connect()
-        
-        # 2. 规划室内巡点航点列表 (NED 相对局部坐标系)
-        # 规则说明：X-北为正, Y-东为正, Z-向下为正（所以想要在 1.5 米高度飞，Z 必须为 -1.5）
-        # yaw：偏航角角度(0-360度)，0代表正北
-        my_waypoints = [
-            {'x': 1.0,  'y': 0.0,  'z': -1.5, 'yaw': 0},   # 点1：向正前方推进1米
-            {'x': 1.0,  'y': 1.0,  'z': -1.5, 'yaw': 90},  # 点2：保持前推，向右平移1米，机头偏向正东
-            {'x': 0.0,  'y': 1.0,  'z': -1.5, 'yaw': 180}, # 点3：倒飞回起点水平线，机头朝向正南
-            {'x': 0.0,  'y': 0.0,  'z': -1.5, 'yaw': 270}  # 点4：返回起飞原点，机头朝向正西
-        ]
-        
-        # 3. 初始化任务管理器模块
-        mission = MissionManager(
-            drone=drone,
-            waypoints=my_waypoints,
-            target_altitude=1.5,    # 自动起飞高度 1.5 米
-            arrival_radius=0.25,    # 判定到点的欧氏距离误差阈值锁定在 25 厘米以内
-            hold_duration=4.0       # 每个点到达后悬停停留 4 秒
-        )
-        
-        print("\n================ 自动巡点系统就绪 ================")
-        print("提示: 现场安全员请时刻保持遥控器手柄在握，一旦发生异常，切出控制模式即可随时越权人工接管。")
-        print("================================================\n")
-        
-        # 4. 高频业务轮询主循环
+        # 高频业务控制主循环 (10Hz)
         while True:
-            # 驱动任务状态机
-            is_mission_finished = mission.update()
-            
-            if is_mission_finished:
-                print("\n[通知] 主程序检测到巡航任务模块已正常运行结束，退出程序。")
+            # 轮询状态机
+            is_finished = manager.update()
+            if is_finished:
+                print("=================== 整个巡航任务已安全退出 ===================")
                 break
-                
-            # 20Hz 的控制频率（50ms一拍），既能保证位置控制实时下发，又不会拖垮处理器
-            time.sleep(0.05)
-            
+
+            time.sleep(0.1)  # 严格的 10Hz 轮询，配合管理器内部 5Hz 下发，完美防失控
+
+    except FailsafeTriggered as e:
+        # 4. 最强安全保护：一旦遥控器切出模式，代码在这里捕获，直接结束整个 Python 进程
+        print(f"\n🚨 [主循环紧急熔断] 系统安全退出: {e}。香橙派已处于安全挂起状态，不占用串口输出。")
     except KeyboardInterrupt:
-        print("\n🛑 用户手动中止程序 (Ctrl+C)！正在触发紧急安全退出。")
+        print("\n用户手动通过 Ctrl+C 终止了上位机脚本。")
     finally:
-        # 5. 清理与释放资源
-        print("[清理] 正在关闭后台遥测数据链线程...")
-        drone.disconnect()
-        print("[清理] 程序已安全解脱。")
+        uav.running = False  # 销毁并关闭底层遥测监听守护线程
+
 
 if __name__ == '__main__':
     main()
