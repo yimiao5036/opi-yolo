@@ -55,8 +55,8 @@ class MissionManager:
         # ----------------- 状态机逻辑 -----------------
         if self.state == MissionState.INIT:
             if self.drone.is_connected:
-                print("\n[状态] 飞控通信已建立，准备切换至 GUIDED 模式并解锁...")
-                if self.drone.set_mode('GUIDED'):   #若为 PX4 则是OFFBOARD
+                print("\n[状态] 飞控通信已建立，准备切换至 OFFBOARD 模式并解锁...")
+                if self.drone.set_mode('OFFBOARD'):   #若为 PX4 则是OFFBOARD; ArduPilot 则为 GUIDED
                     self.state = MissionState.ARMING
             else:
                 print("\r[状态] 等待飞控心跳包连接...", end="", flush=True)
