@@ -1,4 +1,5 @@
 import time
+import json
 from drone_controller.base_control import DroneController
 from drone_controller.mission_manager import MissionManager, FailsafeTriggered
 
@@ -10,10 +11,17 @@ flight_waypoints = [
     {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},  # 航点 3：回到原点上方，高度降到 1.2 米
 ]
 
+def load_config(config_path="./config.json"):
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
 
 def main():
+    # 加载配置
+    config = load_config()
+    cfg = config["flight_control"]
     # 2. 初始化底层 SDK 驱动
-    uav = DroneController(connection_string='/dev/ttyUSB0', baud=115200)
+    uav = DroneController(connection_string=cfg.get("connection_string"), baud=cfg.get("baud_rate"))
     if not uav.connect():
         print("物理串口打开失败，请检查数传连接或端口权限。")
         return
