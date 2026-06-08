@@ -1,173 +1,199 @@
-import time
 import threading
+import time
 from pymavlink import mavutil
 
 
-class QGCMissionProxy:
-    def __init__(self, qgc_link):
+class QGCMissionReceiver:
+    def __init__(self, connection_str='udpin:0.0.0.0:14550', sys_id=1, comp_id=1, home_lat=34.0, home_lon=113.0):
         """
-        :param qgc_link: 专门连接地面站数传电台的 mavutil 链接对象
+        QGC 航线拦截接收器 (模拟飞控节点)
+        :param connection_str: pymavlink连接字符串。udpin:0.0.0.0:14550 表示作为本地服务器等待QGC主动连接
+        :param sys_id: 伪装的系统ID (通常飞控为1)
+        :param comp_id: 伪装的组件ID (通常飞控为1)
+        :param home_lat: 模拟的起始点纬度（用于在没有真实GPS的室内环境让QGC地图定点）
+        :param home_lon: 模拟的起始点经度
         """
-        self.qgc = qgc_link
-        self.translated_waypoints = []  # 翻译出来供你本地 mission_manager 使用的航点列表
-        self.is_mission_ready = False
-        self.running = True
+        self.connection_str = connection_str
+        self.sys_id = sys_id
+        self.comp_id = comp_id
+        self.home_lat = home_lat
+        self.home_lon = home_lon
 
-        # 锁机制防止数据脏读
+        # 初始化 MAVLink 链路
+        self.master = mavutil.mavlink_connection(
+            self.connection_str,
+            source_system=self.sys_id,
+            source_component=self.comp_id
+        )
+
+        # 线程安全与航点存储
         self.lock = threading.Lock()
+        self.waypoints_list = []  # 正式供外部控制脚本读取的航点列表
+        self._temp_waypoints = []  # 协议传输过程中的临时缓存缓存
 
-        # 启动后台监听线程
-        self.proxy_thread = threading.Thread(target=self._listen_qgc_loop, daemon=True)
-        self.proxy_thread.start()
+        # 协议状态控制变量
+        self.is_running = False
+        self.expected_count = 0
+        self.current_seq = 0
 
-    def _listen_qgc_loop(self):
-        """高频监听地面站发来的 MAVLink 消息"""
-        print("[QGC Proxy] 拦截网关已启动，等待地面站上传航线...")
+    def start(self):
+        """启动后台模拟线程"""
+        self.is_running = True
 
-        while self.running:
+        # 线程 1-A: 维持心跳与状态遥测广播 (5Hz)
+        self.telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
+        self.telemetry_thread.start()
+
+        # 线程 1-B: 专门阻塞监听并应答 QGC 的航线握手协议
+        self.protocol_thread = threading.Thread(target=self._protocol_loop, daemon=True)
+        self.protocol_thread.start()
+
+        print(f"[QGCMissionProxy] 虚拟飞控线程已启动，正在监听 UDP 端口: {self.connection_str}")
+
+    def stop(self):
+        """停止接收器"""
+        self.is_running = False
+        if self.master:
+            self.master.close()
+        print("[QGCMissionProxy] 虚拟飞控线程已关闭")
+
+    def _telemetry_loop(self):
+        """高频向QGC广播心跳和定位，激活QGC的航线规划和上传按钮"""
+        boot_time = time.time()
+        while self.is_running:
             try:
-                # 阻塞读取来自 QGC 的消息，超时时间为0.5秒
-                msg = self.qgc.recv_match(blocking=True, timeout=0.5)
+                time_ms = int((time.time() - boot_time) * 1000)
+
+                # 1. 发送 HEARTBEAT (伪装成运行中的 ArduPilot 多旋翼，且处于 GUIDED 模式解锁状态)
+                self.master.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_QUADROTOR,  # 四轴/多旋翼
+                    mavutil.mavlink.MAV_AUTOPILOT_ARDUPILOT,  # 固件类型
+                    mavutil.mavlink.MAV_MODE_FLAG_GUIDED_ENABLED | mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED,
+                    0,  # custom_mode
+                    mavutil.mavlink.MAV_STATE_ACTIVE  # 活动状态
+                )
+
+                # 2. 发送 GLOBAL_POSITION_INT (不发这个QGC地图无法显示飞机，也无法规划航线)
+                self.master.mav.global_position_int_send(
+                    time_ms,
+                    int(self.home_lat * 1e7),  # 纬度 (degrees * 1E7)
+                    int(self.home_lon * 1e7),  # 经度 (degrees * 1E7)
+                    10000,  # 绝对高度 (毫米, 10米)
+                    0,  # 相对高度 (毫米, 0米)
+                    0, 0, 0,  # vx, vy, vz 速度 (cm/s)
+                    9000  # hdg 偏航角 (cdeg, 90度朝东)
+                )
+
+                # 3. 发送系统状态 (维持QGC右上角图标正常显示，可选)
+                self.master.mav.sys_status_send(0, 0, 0, 500, 11100, 100, 80, 0, 0, 0, 0, 0, 0)
+
+            except Exception as e:
+                print(f"[QGCMissionProxy] 遥测发送异常: {e}")
+            time.sleep(0.2)  # 5Hz 频率广播
+
+    def _protocol_loop(self):
+        """标准 MAVLink 航线协议状态机逻辑"""
+        while self.is_running:
+            try:
+                # 阻塞读取消息
+                msg = self.master.recv_match(blocking=True, timeout=0.5)
                 if not msg:
                     continue
 
                 msg_type = msg.get_type()
+                src_sys = msg.get_srcSystem()
+                src_comp = msg.get_srcComponent()
 
-                # 1. 拦截：收到地面站宣告的航点总数
+                # ---- 阶段 A: QGC点击了“发送航线”，通知飞机即将上传的总数 ----
                 if msg_type == 'MISSION_COUNT':
-                    self._handle_mission_count(msg)
+                    self.expected_count = msg.count
+                    self.current_seq = 0
+                    self._temp_waypoints = []
+                    print(f"\n[QGCMissionProxy] 拦截到QGC航线上传请求！预计航点总数: {self.expected_count}")
 
-                # 2. 拦截：收到地面站发来的开始执行命令
-                elif msg_type == 'COMMAND_LONG':
-                    if msg.command == mavutil.mavlink.MAV_CMD_MISSION_START:
-                        self._handle_mission_start()
-                    elif msg.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
-                        print(f"[QGC Proxy] 拦截到地面站解锁指令 -> 参数: {msg.param1}")
+                    if self.expected_count > 0:
+                        # 核心回复：主动向地面站索要第 0 个航点数据
+                        self.master.mav.mission_request_int_send(
+                            src_sys, src_comp, self.current_seq, msg.mission_type
+                        )
+                    else:
+                        # 总数为0则直接发送成功确认
+                        self.master.mav.mission_ack_send(
+                            src_sys, src_comp, mavutil.mavlink.MAV_MISSION_ACCEPTED, msg.mission_type
+                        )
+
+                # ---- 阶段 B: 接收具体的航点细节 (新版QGC通常使用 MISSION_ITEM_INT 整型坐标协议) ----
+                elif msg_type == 'MISSION_ITEM_INT':
+                    if msg.seq == self.current_seq:
+                        # 解析QGC发来的单条数据
+                        wp = {
+                            'seq': msg.seq,
+                            'frame': msg.frame,
+                            'command': msg.command,
+                            'lat': msg.x / 1e7,  # 还原浮点经纬度
+                            'lon': msg.y / 1e7,
+                            'alt': msg.z,  # 高度
+                            'param1': msg.param1,  # 悬停时间等控制参数
+                            'param2': msg.param2,
+                            'param3': msg.param3,
+                            'param4': msg.param4
+                        }
+                        self._temp_waypoints.append(wp)
+                        print(
+                            f"[QGCMissionProxy] 成功接收并缓存航点 [{msg.seq + 1}/{self.expected_count}]: Lat={wp['lat']:.6f}, Lon={wp['lon']:.6f}, Alt={wp['alt']:.2f}m")
+
+                        self.current_seq += 1
+                        if self.current_seq < self.expected_count:
+                            # 继续索要下一个航点
+                            self.master.mav.mission_request_int_send(
+                                src_sys, src_comp, self.current_seq, msg.mission_type
+                            )
+                        else:
+                            # ---- 阶段 C: 全部接收完毕，原子化存入正式列表，并向QGC回复“握手成功” ----
+                            with self.lock:
+                                self.waypoints_list = list(self._temp_waypoints)
+                            print(f"🎉 [QGCMissionProxy] 航线完美拦截并填充！列表当前长度: {len(self.waypoints_list)}")
+
+                            self.master.mav.mission_ack_send(
+                                src_sys, src_comp, mavutil.mavlink.MAV_MISSION_ACCEPTED, msg.mission_type
+                            )
+
+                # ---- 兼容机制: 兼容老版本QGC使用的浮点数协议形式 ----
+                elif msg_type == 'MISSION_ITEM':
+                    if msg.seq == self.current_seq:
+                        wp = {
+                            'seq': msg.seq, 'frame': msg.frame, 'command': msg.command,
+                            'lat': msg.x, 'lon': msg.y, 'alt': msg.z,
+                            'param1': msg.param1, 'param2': msg.param2, 'param3': msg.param3, 'param4': msg.param4
+                        }
+                        self._temp_waypoints.append(wp)
+                        self.current_seq += 1
+                        if self.current_seq < self.expected_count:
+                            self.master.mav.mission_request_send(src_sys, src_comp, self.current_seq, msg.mission_type)
+                        else:
+                            with self.lock:
+                                self.waypoints_list = list(self._temp_waypoints)
+                            self.master.mav.mission_ack_send(src_sys, src_comp, mavutil.mavlink.MAV_MISSION_ACCEPTED,
+                                                             msg.mission_type)
+
+                # ---- 处理地面站点击“清除航线”的请求 ----
+                elif msg_type == 'MISSION_CLEAR_ALL':
+                    print("[QGCMissionProxy] 拦截到QGC清除航线指令")
+                    with self.lock:
+                        self.waypoints_list = []
+                    self.master.mav.mission_ack_send(src_sys, src_comp, mavutil.mavlink.MAV_MISSION_ACCEPTED,
+                                                     msg.mission_type)
 
             except Exception as e:
-                print(f"[QGC Proxy] 接收异常: {e}")
+                print(f"[QGCMissionProxy] 协议状态机运行异常: {e}")
                 time.sleep(0.1)
 
-    def _handle_mission_count(self, msg):
-        """处理航点上传握手协议"""
-        target_system = msg.target_system
-        target_component = msg.target_component
-        wp_count = msg.count
-
-        print(f"[QGC Proxy] 检测到 QGC 正在上传航线，包含航点数量: {wp_count}")
-
-        temp_waypoints = []
-        handshake_success = True
-
-        # 依次向 QGC 请求每一个航点的具体坐标
-        for i in range(wp_count):
-            # 向 QGC 请求第 i 个航点 (使用 MISSION_REQUEST_INT 保证高精度)
-            self.qgc.mav.mission_request_int_send(
-                target_system,
-                target_component,
-                i,
-                mavutil.mavlink.MAV_MISSION_TYPE_MISSION
-            )
-
-            # 等待 QGC 回应具体的航点条目
-            item_msg = self.qgc.recv_match(type='MISSION_ITEM_INT', blocking=True, timeout=2.0)
-
-            if item_msg is None:
-                print(f"[QGC Proxy] 错误: 请求航点 {i} 超时，中止握手。")
-                handshake_success = False
-                break
-
-            # 解析地理/局部坐标
-            # frame 1: MAV_FRAME_GLOBAL_INT (室外经纬度)
-            # frame 12: MAV_FRAME_LOCAL_NED (室内/本地局部坐标)
-            frame = item_msg.frame
-
-            # 坐标转换逻辑（核心翻译部分）
-            if frame == mavutil.mavlink.MAV_FRAME_LOCAL_NED:
-                # 如果同伴在 QGC 规划的是室内本地 NED 坐标，直接除以 1000 转换为米
-                x = item_msg.x / 1000.0
-                y = item_msg.y / 1000.0
-                z = item_msg.z / 1000.0  # 注意：飞控 NED 的 Z 轴向下为正
-            elif frame in [mavutil.mavlink.MAV_FRAME_GLOBAL_INT, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT]:
-                # 如果是室外 GPS 航点
-                # x 乘以 1e-7 得到 纬度，y 乘以 1e-7 得到 经度
-                lat = item_msg.x / 1e7
-                lon = item_msg.y / 1e7
-                alt = item_msg.z  # 高度（米）
-
-                # 【关键生产力转换】：在此处可以调用你在本地计算的投影函数，将经纬度转换为相对起始点的 (x, y) 米
-                x, y = self._gps_to_local_meters(lat, lon)
-                z = -alt  # 转换为你本地代码习惯的 Z 轴定义（若你的代码向上为正，则取负值；若严格遵循 NED 则保持向下为正）
-            else:
-                x, y, z = 0.0, 0.0, 0.0
-
-            # 提取航点附加动作参数（如偏航角、悬停时间）
-            param1_hold_time = item_msg.param1  # 悬停时间（秒）
-            param4_yaw = item_msg.param4  # 期望偏航角（度）
-
-            # 翻译并打包成符合你本地脚本格式的字典对象
-            wp_dict = {
-                "index": i,
-                "command": item_msg.command,  # 如 MAV_CMD_NAV_WAYPOINT
-                "x": x,
-                "y": y,
-                "z": z,
-                "hold_time": param1_hold_time if param1_hold_time > 0 else 3.0,  # 缺省悬停3秒
-                "yaw": param4_yaw
-            }
-            temp_waypoints.append(wp_dict)
-            print(f" -> 成功拦截并翻译航点 [{i}]: X={x:.2f}, Y={y:.2f}, Z={z:.2f}, 偏航={param4_yaw}°")
-
-        if handshake_success:
-            # 向 QGC 发送 MISSION_ACK，宣告上传成功，让地面站界面显示绿色的“保存成功”
-            self.qgc.mav.mission_ack_send(
-                target_system,
-                target_component,
-                mavutil.mavlink.MAV_MISSION_RESULT_ACCEPTED,
-                mavutil.mavlink.MAV_MISSION_TYPE_MISSION
-            )
-            with self.lock:
-                self.translated_waypoints = temp_waypoints
-                self.is_mission_ready = True
-            print("[QGC Proxy] 航线拦截握手完美结束！影子航线已在香橙派内存中就绪。")
-        else:
-            # 告诉 QGC 上传失败
-            self.qgc.mav.mission_ack_send(
-                target_system,
-                target_component,
-                mavutil.mavlink.MAV_MISSION_RESULT_ERROR,
-                mavutil.mavlink.MAV_MISSION_TYPE_MISSION
-            )
-
-    def _gps_to_local_meters(self, lat, lon):
-        """
-        一个简易的平地经纬度转局部米制坐标函数。
-        实际使用中，可以保存起飞点的经纬度作为参考原点（Home点）。
-        """
-        # 伪代码演示，你可以替换为标准的 GeographicLib 或 pyproj 投影库
-        # 这里假设以固定参考点进行转换
-        home_lat, home_lon = 30.000000, 120.000000
-        delta_lat = lat - home_lat
-        delta_lon = lon - home_lon
-
-        # 地球每度纬度约为 111320 米
-        x_meters = delta_lat * 111320.0
-        # 经度长度随纬度余弦收缩
-        y_meters = delta_lon * 111320.0 * 0.866
-        return x_meters, y_meters
-
-    def _handle_mission_start(self):
-        """当地面站点击『开始任务』时触发该本地回调"""
-        print("[QGC Proxy] 地面站发出了【START MISSION】指令！")
-        # 这里用来激活你在香橙派上写的状态机
-        # 例如将全局事件设置为 True：event_start_local_mission.set()
-
-    def get_local_waypoints(self):
-        """提供给你本地外部业务循环读取的接口"""
+    def get_waypoints(self):
+        """提供给控制主线程调用的线程安全方法：获取当前最新的航点列表"""
         with self.lock:
-            if self.is_mission_ready:
-                return self.translated_waypoints
-            return None
+            return list(self.waypoints_list)
 
-    def close(self):
-        self.running = False
+    def clear_waypoints(self):
+        """从香橙派端手动清空列表"""
+        with self.lock:
+            self.waypoints_list = []
