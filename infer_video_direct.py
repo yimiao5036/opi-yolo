@@ -11,7 +11,7 @@ from ais_bench.infer.interface import InferSession
 MODEL_PATH = "./om/yolo26n-balloon.om"          # YOLO26 模型路径
 INPUT_VIDEO = "./asset/test_video.mp4"          # 输入的测试视频
 RTSP_URL = "rtsp://192.168.144.25:8554/main.264"
-CONF_THRESHOLD = 0.25                           # 置信度阈值
+CONF_THRESHOLD = 0.50                           # 置信度阈值
 
 # -------------- 无线图传网络配置 --------------
 GROUND_STATION_IP = "192.168.31.239"            # 地面站的局域网 IP

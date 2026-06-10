@@ -15,7 +15,7 @@ from drone_controller.pid_counter import PID
 # ===================================================
 
 class VideoStreaming:
-    """ 📡 视频流采集与后台图传模块 """
+    """ 📡 视频流采集与后台图传模块（支持 RTSP 自动重连） """
 
     def __init__(self, video_cfg, net_cfg):
         self.video_source = video_cfg.get("video_source", 0)
@@ -23,32 +23,108 @@ class VideoStreaming:
         self.gs_ip = net_cfg.get("ground_station_ip", "127.0.0.1")
         self.udp_port = net_cfg.get("udp_port", 9999)
 
-        self.cap = cv2.VideoCapture(self.video_source)
-        self.tx_queue = queue.Queue(maxsize=2)  # 限制队列，防积压
+        # RTSP 特殊参数
+        self.is_rtsp = isinstance(self.video_source, str) and self.video_source.startswith("rtsp://")
+        self.cap = None
+        self.frame_buffer = queue.Queue(maxsize=1)   # 只保留最新一帧
         self.is_running = True
+        self.capture_thread = None
 
-        if not self.cap.isOpened():
-            raise RuntimeError(f"❌ 无法打开视频源: {self.video_source}")
+        # 启动后台采集线程
+        self._start_capture_thread()
 
-        # 启动后台图传线程
+        # 图传发送队列与线程（原样保留）
+        self.tx_queue = queue.Queue(maxsize=2)
         self.sender_thread = threading.Thread(target=self._udp_stream_sender_worker, daemon=True)
         self.sender_thread.start()
 
+    def _start_capture_thread(self):
+        """ 独立线程负责从摄像头/RTSP 读取帧，避免主循环阻塞 """
+        self.capture_thread = threading.Thread(target=self._capture_worker, daemon=True)
+        self.capture_thread.start()
+
+    def _capture_worker(self):
+        """ 后台不断读取帧，存入 frame_buffer """
+        while self.is_running:
+            # 如果摄像头未打开或已断开，尝试连接
+            if self.cap is None or not self.cap.isOpened():
+                self._open_camera()
+                if self.cap is None or not self.cap.isOpened():
+                    time.sleep(1)   # 等待重连
+                    continue
+
+            ret, frame = self.cap.read()
+            if not ret:
+                # 读取失败，关闭并标记需重连
+                print("⚠️ RTSP 读取失败，准备重连...")
+                self.cap.release()
+                self.cap = None
+                continue
+
+            # 清空旧帧，只保留最新一帧
+            while not self.frame_buffer.empty():
+                try:
+                    self.frame_buffer.get_nowait()
+                except queue.Empty:
+                    break
+            self.frame_buffer.put(frame)
+
+        if self.cap is not None:
+            self.cap.release()
+
+    def _open_camera(self):
+        """ 打开摄像头或 RTSP 流，并设置低延迟参数 """
+        try:
+            print(f"📷 正在连接视频源: {self.video_source}")
+            self.cap = cv2.VideoCapture(self.video_source)
+
+            if self.is_rtsp:
+                # 设置 RTSP 缓冲区大小（只保留 1 帧，降低延迟）
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                # 设置读取超时（OpenCV 没有直接超时参数，但可尝试设置后端属性）
+                # 某些平台支持以下设置：
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                # 强制使用 tcp 协议（某些 rtsp 默认 udp 会丢包严重）
+                # 如果 rtsp 地址支持，可以改成 "rtsp://...?tcp"
+                if "?" not in self.video_source:
+                    self.video_source += "?tcp"
+                    # 注意：有些相机需要重新初始化，这里简单打印提示
+                    print("💡 建议使用 TCP 传输: 在 RTSP URL 后添加 ?tcp")
+            else:
+                # USB 摄像头也可设置缓冲区
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # 可选：强制指定分辨率（根据你的相机调整）
+            # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+            if self.cap.isOpened():
+                print("✅ 视频源连接成功")
+            else:
+                print("❌ 视频源打开失败")
+        except Exception as e:
+            print(f"❌ 打开视频源异常: {e}")
+            self.cap = None
+
     def read_frame(self):
-        """ 读取一帧原始图像 """
-        return self.cap.read()
+        """ 主循环调用：从缓冲区获取最新一帧（非阻塞） """
+        try:
+            frame = self.frame_buffer.get_nowait()
+            return True, frame
+        except queue.Empty:
+            # 没有新帧时返回 False，主循环可根据需要 sleep
+            return False, None
 
     def push_to_stream(self, frame):
-        """ 非阻塞式推入图传队列 """
+        """ 原图传推流逻辑保持不变 """
         try:
-            # 推送前轻量化分辨率，降低带宽压力
             send_frame = cv2.resize(frame, (640, 480))
             self.tx_queue.put_nowait(send_frame)
         except queue.Full:
-            pass  # 队列满则直接丢帧
+            pass
 
     def _udp_stream_sender_worker(self):
-        """ 后台图传专用工作线程 """
+        """ 原图传发送线程（未改动） """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_address = (self.gs_ip, self.udp_port)
         print(f"📡 图传后台线程已启动，目标地面站 -> {self.gs_ip}:{self.udp_port}")
@@ -58,30 +134,29 @@ class VideoStreaming:
                 frame_to_send = self.tx_queue.get(timeout=1.0)
                 if frame_to_send is None:
                     break
-
-                result, img_encode = cv2.imencode('.jpg', frame_to_send, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
+                result, img_encode = cv2.imencode('.jpg', frame_to_send,
+                                                  [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality])
                 if not result:
                     continue
-
                 data = img_encode.tobytes()
-                if len(data) > 65000:  # 严格防丢包限制
+                if len(data) > 65000:
                     continue
-
                 sock.sendto(data, server_address)
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"❌ 图传线程异常: {e}")
                 time.sleep(0.1)
-
         sock.close()
 
     def release(self):
         """ 释放资源 """
         self.is_running = False
+        if self.capture_thread is not None:
+            self.capture_thread.join(timeout=2.0)
+        if self.cap is not None:
+            self.cap.release()
         self.tx_queue.put(None)
-        self.cap.release()
-
 
 class YOLO26UAVInfer:
     """ 🚀 昇腾 NPU 推理与图像后处理模块 """

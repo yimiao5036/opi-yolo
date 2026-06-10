@@ -5,7 +5,7 @@
         "device_id": 0
     },
     "video": {
-        "video_source": 0,
+        "video_source": "rtsp://192.168.144.25:8554/main.264",
         "jpeg_quality": 75
     },
     "network": {
