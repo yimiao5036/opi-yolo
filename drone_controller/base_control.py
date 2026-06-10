@@ -57,7 +57,8 @@ class DroneController:
         """初始化 MAVLink 串口连接，并等待首个心跳包"""
         try:
             print(f"正在尝试连接飞控 ({self.connection_string})...")
-            self.master = mavutil.mavlink_connection(self.connection_string, baud=self.baud)
+            # 当使用udp时网络不再重要
+            self.master = mavutil.mavlink_connection(self.connection_string)
             self.master.wait_heartbeat(timeout=5)
             self.is_connected = True
             self.last_heartbeat_time = time.time()
