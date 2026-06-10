@@ -85,7 +85,7 @@ class MissionManager:
                 print(f"[INIT] 起始点坐标: ({self.home_x:.2f}, {self.home_y:.2f}, {self.home_z:.2f})")
                 print("[INIT] 正在下发 GUIDED/OFFBOARD 模式并尝试解锁...")
 
-                target_mode = 'GUIDED' if 'guided' in self.drone.current_mode.lower() or True else 'OFFBOARD'
+                target_mode = "OFFBOARD" if "OFFBOARD" in self.drone.master.mode_mapping() else "GUIDED"
                 self.drone.set_mode(target_mode)
                 self.drone.arm()
                 self.state = MissionState.ARMING

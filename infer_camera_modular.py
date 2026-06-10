@@ -250,6 +250,7 @@ class UAVControlLoop:
     def start_uav(self):
         """ 连接并解锁无人机 """
         self.uav.connect()
+        self.uav.print_status()
         if not self.uav.is_armed and self.uav.current_mode not in ['GUIDED', 'OFFBOARD']:
             self.uav.arm()
 
@@ -324,14 +325,15 @@ def main():
     # 启动无人机连接
     controller.start_uav()
 
+
     print("🚀 NPU 精准推理 [JSON配置动态加载版] 主循环启动...")
 
     try:
         while True:
             ret, frame = streamer.read_frame()
             if not ret:
-                print("❌ 未能读取到摄像头数据，退出中...")
-                break
+                time.sleep(0.005)
+                continue
 
             orig_shape = frame.shape[:2]
 

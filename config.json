@@ -16,6 +16,9 @@
         "connection_string": "/dev/ttyUSB0",
         "baud_rate": 57600
     },
+    "fc_info":{
+        "type": "ardupilot"
+    },
     "pid_y": {
         "kp": 1.0,
         "ki": 0.02,
