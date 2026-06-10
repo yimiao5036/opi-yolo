@@ -231,7 +231,7 @@ class UAVControlLoop:
     """ 🛸 无人机飞控闭环控制核心 """
 
     def __init__(self, fc_cfg, pid_y_cfg, pid_z_cfg):
-        connection_string = fc_cfg.get("connection_string", "/dev/ttyUSB0")
+        connection_string = fc_cfg.get("connection_string", "udpout:172.0.0.1:14550")
         baud_rate = fc_cfg.get("baud_rate", 57600)
 
         # 初始化控制驱动端

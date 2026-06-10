@@ -13,7 +13,7 @@
         "udp_port": 9999
     },
     "flight_control": {
-        "connection_string": "/dev/ttyUSB0",
+        "connection_string": "udpout:172.0.0.1:14550",
         "baud_rate": 57600
     },
     "fc_info":{
