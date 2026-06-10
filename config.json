@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_path": "./om/yolo26n-balloon.om",
+        "model_path": "./om/yolo26n-balloon2.om",
         "conf_threshold": 0.25,
         "device_id": 0
     },
