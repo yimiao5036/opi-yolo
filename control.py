@@ -45,7 +45,7 @@ class PID:
 
 
 class UAVController:
-    def __init__(self, port='/dev/ttyUSB0', baud=57600):
+    def __init__(self, port='/dev/ttyAMA1', baud=57600):
         """
         初始化与飞控的 MAVLink 串口连接
             port:串口地址

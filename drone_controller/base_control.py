@@ -5,7 +5,7 @@ from pymavlink import mavutil
 
 
 class DroneController:
-    def __init__(self, connection_string='udpout:127.0.0.1:14550', baud=115200):
+    def __init__(self, connection_string='/dev/ttyAMA1', baud=115200):
         self.connection_string = connection_string
         self.baud = baud
         self.master = None
@@ -57,8 +57,7 @@ class DroneController:
         """初始化 MAVLink 串口连接，并等待首个心跳包"""
         try:
             print(f"正在尝试连接飞控 ({self.connection_string})...")
-            # 当使用udp时网络不再重要
-            self.master = mavutil.mavlink_connection(self.connection_string)
+            self.master = mavutil.mavlink_connection(self.connection_string, baud=self.baud)
             self.master.wait_heartbeat(timeout=5)
             self.is_connected = True
             self.last_heartbeat_time = time.time()
