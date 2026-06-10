@@ -5,7 +5,7 @@ from pymavlink import mavutil
 
 
 class DroneController:
-    def __init__(self, connection_string='/dev/ttyUSB0', baud=115200):
+    def __init__(self, connection_string='udpout:127.0.0.1:14550', baud=115200):
         self.connection_string = connection_string
         self.baud = baud
         self.master = None
