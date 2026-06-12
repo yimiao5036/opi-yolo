@@ -89,6 +89,9 @@ class RouterProxy:
         self._latest_state = None
         self._state_lock = threading.Lock()
 
+        # ---- 首次 STATE 标记 ----
+        self._first_state_received = False
+
         # ---- SUB 监听线程 ----
         self._running = False
         self._sub_thread = None
@@ -106,6 +109,21 @@ class RouterProxy:
         with self._seq_lock:
             self._seq += 1
             return self._seq
+
+    def _build_send_summary(self, msg: dict) -> str:
+        """构建发送消息的内容概要，用于日志"""
+        msg_type = msg.get("type", "?")
+        if msg_type == "SETPOINT":
+            sp = msg.get("setpoint", {})
+            return ", ".join(f"{k}={v}" for k, v in sp.items())
+        elif msg_type == "COMMAND":
+            return f"command={msg.get('command')}"
+        elif msg_type == "QUERY":
+            return f"query={msg.get('query')}"
+        elif msg_type == "WAYPOINT":
+            wp = msg.get("waypoint", {})
+            return ", ".join(f"{k}={v}" for k, v in wp.items())
+        return str(msg)
 
     def _recover_req(self):
         """
@@ -224,21 +242,27 @@ class RouterProxy:
             (ok: bool, ack_dict: dict)
             ack_dict 示例：{"type": "ACK", "ref_id": 1, "status": "OK", "message": ""}
         """
+        msg_type = msg.get("type", "?")
+        msg_id = msg.get("id", "?")
+        summary = self._build_send_summary(msg)
+        logger.debug("Sending %s id=%s: %s", msg_type, msg_id, summary)
         try:
             self.req.send_string(json.dumps(msg))
             ack_str = self.req.recv_string()
             ack = json.loads(ack_str)
             ok = ack.get("status") == "OK"
+            logger.info("ACK received for id=%s, status=%s",
+                        ack.get("ref_id"), ack.get("status"))
             if not ok:
                 logger.warning("ACK 非 OK: type=%s id=%s ack=%s",
-                               msg.get("type"), msg.get("id"), ack)
+                               msg_type, msg_id, ack)
             return ok, ack
         except zmq.Again:
-            logger.error("REQ recv 超时 (type=%s id=%s)", msg.get("type"), msg.get("id"))
+            logger.error("REQ recv 超时 (type=%s id=%s)", msg_type, msg_id)
             self._recover_req()
             return False, {"status": "TIMEOUT", "message": "recv timeout"}
         except Exception as e:
-            logger.error("REQ 异常: %s", e)
+            logger.error("REQ 异常 (type=%s id=%s): %s", msg_type, msg_id, e)
             self._recover_req()
             return False, {"status": "FAIL", "message": str(e)}
 
@@ -278,9 +302,13 @@ class RouterProxy:
             age_us = now_us - state["drone"]["last_update_us"]
         except (KeyError, TypeError):
             return False
-        if age_us >= self.STALE_THRESHOLD_WARN_US:
-            logger.warning("STATE 严重过期: age=%.2fs（阈值=%.1fs）",
-                           age_us / 1e6, stale_threshold_us / 1e6)
+        if age_us >= stale_threshold_us:
+            if age_us >= self.STALE_THRESHOLD_WARN_US:
+                logger.warning("STATE 严重过期: age=%.2fs（阈值=%.0fms）",
+                               age_us / 1e6, stale_threshold_us / 1000)
+            else:
+                logger.warning("STATE 过期: age=%.1fms（阈值=%.0fms）",
+                               age_us / 1000, stale_threshold_us / 1000)
         return age_us < stale_threshold_us
 
     def get_state_freshness(self, state):
@@ -351,6 +379,25 @@ class RouterProxy:
                 if msg_type == "STATE":
                     with self._state_lock:
                         self._latest_state = data
+                        if not self._first_state_received:
+                            self._first_state_received = True
+                            logger.info("首次收到 Router 状态推送")
+
+                    # DEBUG 输出关键字段 + 新鲜度
+                    try:
+                        drone = data.get("drone", {})
+                        now_us = int(time.time() * 1_000_000)
+                        last_up = drone.get("last_update_us", now_us)
+                        age_us = now_us - last_up
+                        logger.debug("STATE: mode=%s armed=%s "
+                                     "alt_rel=%.1f batt=%.0f%% age=%.0fms",
+                                     drone.get("mode"), drone.get("armed"),
+                                     drone.get("alt_rel", 0),
+                                     drone.get("battery", 0),
+                                     age_us / 1000)
+                    except Exception:
+                        pass
+
                     if self._state_callback:
                         try:
                             self._state_callback(data)
@@ -375,7 +422,8 @@ class RouterProxy:
                     # SUB 通道上的 QUERY_REPLY 暂不处理
                     pass
 
-                # 其它消息类型可扩展
+                else:
+                    logger.warning("收到未知消息类型: %s", msg_type)
 
             except zmq.Again:
                 continue

@@ -7,6 +7,7 @@ import queue
 import socket
 import json
 import sys
+import logging
 
 # ================== 昇腾 NPU SDK（保护性导入） =====================
 # 开发机可能无昇腾环境，try-except 确保 import 错误仅告警不崩溃。
@@ -31,6 +32,7 @@ class VideoStreaming:
     """ 📡 视频流采集与后台图传模块（支持 RTSP 自动重连） """
 
     def __init__(self, video_cfg, net_cfg):
+        self.logger = logging.getLogger("VideoStream")
         self.video_source = video_cfg.get("video_source", 0)
         self.jpeg_quality = video_cfg.get("jpeg_quality", 75)
         self.gs_ip = net_cfg.get("ground_station_ip", "127.0.0.1")
@@ -69,17 +71,21 @@ class VideoStreaming:
             ret, frame = self.cap.read()
             if not ret:
                 # 读取失败，关闭并标记需重连
-                print("⚠️ RTSP 读取失败，准备重连...")
+                self.logger.warning("RTSP 读取失败，准备重连...")
                 self.cap.release()
                 self.cap = None
                 continue
 
             # 清空旧帧，只保留最新一帧
+            dropped = 0
             while not self.frame_buffer.empty():
                 try:
                     self.frame_buffer.get_nowait()
+                    dropped += 1
                 except queue.Empty:
                     break
+            if dropped > 0:
+                self.logger.debug("丢弃旧帧 %d 帧（缓冲区刷新）", dropped)
             self.frame_buffer.put(frame)
 
         if self.cap is not None:
@@ -88,7 +94,7 @@ class VideoStreaming:
     def _open_camera(self):
         """ 打开摄像头或 RTSP 流，并设置低延迟参数 """
         try:
-            print(f"📷 正在连接视频源: {self.video_source}")
+            self.logger.info("正在连接视频源: %s", self.video_source)
             self.cap = cv2.VideoCapture(self.video_source)
 
             if self.is_rtsp:
@@ -102,7 +108,7 @@ class VideoStreaming:
                 if "?" not in self.video_source:
                     self.video_source += "?tcp"
                     # 注意：有些相机需要重新初始化，这里简单打印提示
-                    print("💡 建议使用 TCP 传输: 在 RTSP URL 后添加 ?tcp")
+                    self.logger.info("建议使用 TCP 传输: 在 RTSP URL 后添加 ?tcp")
             else:
                 # USB 摄像头也可设置缓冲区
                 self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -112,11 +118,11 @@ class VideoStreaming:
             # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
             if self.cap.isOpened():
-                print("✅ 视频源连接成功")
+                self.logger.info("视频源连接成功: %s", self.video_source)
             else:
-                print("❌ 视频源打开失败")
+                self.logger.error("视频源打开失败: %s", self.video_source)
         except Exception as e:
-            print(f"❌ 打开视频源异常: {e}")
+            self.logger.error("打开视频源异常: %s", e)
             self.cap = None
 
     def read_frame(self):
@@ -137,10 +143,12 @@ class VideoStreaming:
             pass
 
     def _udp_stream_sender_worker(self):
-        """ 原图传发送线程（未改动） """
+        """ 原图传发送线程（增加帧统计日志） """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_address = (self.gs_ip, self.udp_port)
-        print(f"📡 图传后台线程已启动，目标地面站 -> {self.gs_ip}:{self.udp_port}")
+        self.logger.info("图传后台线程已启动，目标地面站 -> %s:%s",
+                         self.gs_ip, self.udp_port)
+        send_count = 0
 
         while self.is_running:
             try:
@@ -153,12 +161,16 @@ class VideoStreaming:
                     continue
                 data = img_encode.tobytes()
                 if len(data) > 65000:
+                    self.logger.debug("图像数据过大 (%d bytes), 跳过发送", len(data))
                     continue
                 sock.sendto(data, server_address)
+                send_count += 1
+                if send_count % 100 == 0:
+                    self.logger.info("图传统计: 已发送 %d 帧 UDP 数据包", send_count)
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"❌ 图传线程异常: {e}")
+                self.logger.exception("图传线程异常: %s", e)
                 time.sleep(0.1)
         sock.close()
 
@@ -176,6 +188,7 @@ class YOLO26UAVInfer:
     """ 🚀 昇腾 NPU 推理与图像后处理模块 """
 
     def __init__(self, model_cfg):
+        self.logger = logging.getLogger("YOLO")
         model_path = model_cfg.get("model_path", "./om/yolo26n-balloon.om")
         device_id = model_cfg.get("device_id", 0)
         self.conf_threshold = model_cfg.get("conf_threshold", 0.25)
@@ -186,6 +199,8 @@ class YOLO26UAVInfer:
         self.session = InferSession(device_id, model_path)
         self.input_width = 640
         self.input_height = 640
+        self.logger.info("模型加载成功: path=%s input_size=%dx%d",
+                         model_path, self.input_width, self.input_height)
 
     def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114)):
         shape = img.shape[:2]  # [height, width]
@@ -208,6 +223,8 @@ class YOLO26UAVInfer:
         input_tensor = np.transpose(input_tensor, (2, 0, 1))
         input_tensor = np.expand_dims(input_tensor, axis=0)
         input_tensor = np.ascontiguousarray(input_tensor)
+        self.logger.debug("预处理: 输入形状 %s -> %s",
+                          str(frame.shape), str(input_tensor.shape))
         return input_tensor, ratio, dwdh
 
     def postprocess(self, outputs, ratio, dwdh, orig_shape):
@@ -229,6 +246,11 @@ class YOLO26UAVInfer:
                 x2 = max(0, min(x2, orig_shape[1]))
                 y2 = max(0, min(y2, orig_shape[0]))
                 detections.append([x1, y1, x2, y2, conf, cls_id])
+        if detections:
+            best = max(detections, key=lambda d: d[4])
+            self.logger.debug("检测到 %d 个目标, 最高置信度: %.3f 中心点: (%.0f, %.0f)",
+                              len(detections), best[4],
+                              (best[0] + best[2]) / 2, (best[1] + best[3]) / 2)
         return detections
 
     def draw_boxes(self, img, detections):
@@ -264,6 +286,8 @@ class UAVControlLoop:
     """
 
     def __init__(self, fc_cfg, pid_y_cfg, pid_z_cfg):
+        self.logger = logging.getLogger("UAVControlLoop")
+
         # ---- 保存 config（供 start_uav 使用如 takeoff_alt 等） ----
         self.fc_cfg = fc_cfg
         # -----------------------------------------------------------
@@ -287,6 +311,8 @@ class UAVControlLoop:
             min_hits=tracker_cfg.get("min_hits", 3),
         )
         self._tracked_result = None   # 跟踪结果（锁保护）
+        # 记录上一次跟踪状态，用于检测状态变化
+        self._last_tracked = False
         # ------------------------------------------------
 
         # 控制参数（按协议改为 20Hz，§4.1 要求 ≥20Hz）
@@ -309,6 +335,11 @@ class UAVControlLoop:
         # ---- 安全刹车请求标志（主线程判丢 → 控制线程执行刹车） ----
         self._brake_requested = False
 
+        # ---- 最近一次发送的速度指令（用于周期性日志打印） ----
+        self._last_vx = 0.0
+        self._last_vy = 0.0
+        self._last_vz = 0.0
+
     def start_uav(self):
         """连接 Router，执行标准起飞序列（协议 §3.3.1）
 
@@ -322,20 +353,20 @@ class UAVControlLoop:
         """
         # ---- ① 启动 ZMQ 代理 ----
         self.proxy.start()
-        print("🔄 RouterProxy 已启动，等待 Router 状态推送...")
+        self.logger.info("RouterProxy 已启动，等待 Router 状态推送...")
 
         # ---- ② 等待收到第一条 STATE ----
         state = None
         for i in range(50):  # 最多等 5 秒
             state = self.proxy.get_latest_state()
             if state is not None:
-                print("✅ 收到 Router 状态推送")
+                self.logger.info("收到 Router 状态推送")
                 break
             time.sleep(0.1)
 
         if state is None:
-            print("❌ 无法获取飞机状态，请检查 Router 是否运行，"
-                  "且 SUB 端口 (tcp://127.0.0.1:5556) 可连通")
+            self.logger.error("无法获取飞机状态，请检查 Router 是否运行，"
+                              "且 SUB 端口 (tcp://127.0.0.1:5556) 可连通")
             return False
 
         armed = state["drone"]["armed"]
@@ -344,8 +375,8 @@ class UAVControlLoop:
         age_us, _ = self.proxy.get_state_freshness(state)
         age_s = (age_us or 0) / 1_000_000
 
-        print(f"📊 初始状态: mode={mode} | armed={armed} | "
-              f"alt_rel={alt_rel:.1f}m | state_age={age_s:.2f}s")
+        self.logger.info("初始状态: mode=%s armed=%s alt_rel=%.1fm state_age=%.2fs",
+                         mode, armed, alt_rel, age_s)
 
         # ---- ③ 解锁（如未解锁） ----
         if not armed:
@@ -358,20 +389,20 @@ class UAVControlLoop:
         takeoff_alt = self.fc_cfg.get("takeoff_alt", 5.0)
 
         if alt_rel < takeoff_alt * 0.9:
-            print(f"🛫 高度 {alt_rel:.1f}m < 目标 {takeoff_alt:.1f}m，执行起飞...")
+            self.logger.info("高度 %.1fm < 目标 %.1fm，执行起飞...", alt_rel, takeoff_alt)
             ok, ack = self.proxy.send_waypoint(
                 action="TAKEOFF", alt=takeoff_alt,
                 alt_frame="RELATIVE", speed=3.0
             )
             if not ok:
-                print(f"⚠️ TAKEOFF 指令 ACK 失败: {ack}，尝试通过 SETPOINT 爬升...")
+                self.logger.warning("TAKEOFF 指令 ACK 失败: %s，尝试通过 SETPOINT 爬升...", ack)
                 # 降级方案：用 POSITION SETPOINT 爬升
                 ok, ack = self.proxy.send_setpoint(
                     x=0, y=0, z=-takeoff_alt, yaw=0.0,
                     control_mode="POSITION"
                 )
                 if not ok:
-                    print(f"❌ 爬升 SETPOINT 也失败: {ack}")
+                    self.logger.error("爬升 SETPOINT 也失败: %s", ack)
                     return False
 
             # 等待爬升
@@ -379,11 +410,12 @@ class UAVControlLoop:
                 state = self.proxy.get_latest_state()
                 if state and state["drone"]["alt_rel"] >= takeoff_alt * 0.9:
                     alt_rel = state["drone"]["alt_rel"]
-                    print(f"✅ 达到目标高度: {alt_rel:.1f}m")
+                    self.logger.info("达到目标高度: %.1fm", alt_rel)
                     break
                 time.sleep(0.1)
             else:
-                print(f"⚠️ 爬升等待超时，当前 alt_rel={state['drone']['alt_rel']:.1f}m，继续执行")
+                alt_now = state["drone"]["alt_rel"] if state else 0
+                self.logger.warning("爬升等待超时，当前 alt_rel=%.1fm，继续执行", alt_now)
 
         # ---- ⑤ 预热 + 切换 OFFBOARD ----
         if mode != "OFFBOARD":
@@ -391,7 +423,7 @@ class UAVControlLoop:
             state = self.proxy.get_latest_state()
             current_alt = state["drone"]["alt_rel"] if state else takeoff_alt
 
-            print(f"🔄 发送悬停 SETPOINT 预热 (alt={current_alt:.1f}m)...")
+            self.logger.info("发送悬停 SETPOINT 预热 (alt=%.1fm)...", current_alt)
             ok, ack = self.proxy.send_setpoint(
                 x=0, y=0, z=-current_alt, yaw=0.0,
                 control_mode="POSITION"
@@ -399,12 +431,12 @@ class UAVControlLoop:
             if ok:
                 time.sleep(0.2)  # 等流建立（协议 §3.3.1 ③→④）
             else:
-                print(f"⚠️ 预热 SETPOINT ACK 异常: {ack}，尝试继续...")
+                self.logger.warning("预热 SETPOINT ACK 异常: %s，尝试继续...", ack)
 
-            print("🔄 发送 OFFBOARD 指令...")
+            self.logger.info("发送 OFFBOARD 指令...")
             ok, ack = self.proxy.send_command("OFFBOARD")
             if not ok:
-                print(f"❌ OFFBOARD 指令失败: {ack}")
+                self.logger.error("OFFBOARD 指令失败: %s", ack)
                 return False
 
             # 等待模式切换
@@ -412,11 +444,12 @@ class UAVControlLoop:
                 state = self.proxy.get_latest_state()
                 if state and state["drone"]["mode"] == "OFFBOARD":
                     mode = "OFFBOARD"
-                    print("✅ 已进入 OFFBOARD 模式")
+                    self.logger.info("已进入 OFFBOARD 模式")
                     break
                 time.sleep(0.1)
             else:
-                print(f"❌ OFFBOARD 模式切换超时，当前 mode={state['drone']['mode'] if state else 'N/A'}")
+                mode_str = state["drone"]["mode"] if state else "N/A"
+                self.logger.error("OFFBOARD 模式切换超时，当前 mode=%s", mode_str)
                 return False
 
         # ---- ⑥ 启动独立控制线程 ----
@@ -425,26 +458,26 @@ class UAVControlLoop:
             target=self._control_loop, daemon=True, name="uav-control"
         )
         self.control_thread.start()
-        print("✅ 控制线程已启动 (20Hz)")
+        self.logger.info("控制线程已启动 (%.0fHz)", self.control_hz)
         return True
 
     # ---- 辅助方法 ----
 
     def _do_arm(self):
         """执行解锁序列"""
-        print("🔓 发送 ARM 指令...")
+        self.logger.info("发送 ARM 指令...")
         ok, ack = self.proxy.send_command("ARM")
         if not ok:
-            print(f"❌ ARM 指令发送失败: {ack}")
+            self.logger.error("ARM 指令发送失败: %s", ack)
             return False
         # 等待飞控确认解锁
         for i in range(30):
             state = self.proxy.get_latest_state()
             if state and state["drone"]["armed"]:
-                print("✅ 解锁成功")
+                self.logger.info("解锁成功")
                 return True
             time.sleep(0.1)
-        print("❌ 解锁超时（30 次轮询未确认 armed=true）")
+        self.logger.error("解锁超时（30 次轮询未确认 armed=true）")
         return False
 
     # ---- 主循环调用的接口 ----
@@ -473,12 +506,22 @@ class UAVControlLoop:
         tracked = result.get("tracked", False)
         # ------------------------------------------------
 
+        # ---- 检测跟踪状态变化 ----
+        prev_tracked = self._last_tracked
+        if tracked != prev_tracked:
+            if tracked:
+                self.logger.info("目标已锁定（丢失→锁定）")
+            else:
+                self.logger.info("目标已丢失（锁定→丢失）")
+        self._last_tracked = tracked
+
         # ---- ① Coast 滑行期间：PID 积分清空 ----
         # 卡尔曼预测阶段目标可能漂移，积分项在此累积会导致
         # 目标重获瞬间积分暴冲（I-term windup）
         if tracked and result.get("is_predicted"):
             self.pid_y.reset_integral()
             self.pid_z.reset_integral()
+            self.logger.debug("Coast 预测: 清空 PID 积分")
 
         # ---- ② 目标彻底丢失：请求控制线程执行刹车 ----
         # 注意：不在此处直接调 proxy.send_setpoint 以避免 REQ-REP
@@ -489,6 +532,7 @@ class UAVControlLoop:
             self.pid_z.reset_integral()
             with self.data_lock:
                 self._brake_requested = True
+                self.logger.info("目标丢失，请求刹车")
 
         with self.data_lock:
             self.detections = detections
@@ -512,6 +556,7 @@ class UAVControlLoop:
         无论是否有目标，每次迭代都发送 VELOCITY SETPOINT。
         无目标时速度全零（悬停刹车），满足协议 ≥20Hz 要求。
         """
+        self.logger.info("控制循环线程已启动")
         while self.running:
             start = time.time()
 
@@ -525,6 +570,7 @@ class UAVControlLoop:
             # 主线程超过 500ms 未更新 → 强制判丢（覆盖摄像头断流/主线程卡死）
             if time.time() - last_update > 0.5:
                 tracked = None
+                self.logger.warning("主线程超过 500ms 未更新检测结果，强制判丢")
 
             # ---- ③ 解析跟踪结果 → 速度指令（使用跟踪器输出的平滑中心点） ----
             vx, vy, vz = self._velocity_from_tracker(tracked, w, h)
@@ -539,8 +585,14 @@ class UAVControlLoop:
                     # 同时清空 PID（确保 PD 也归零）
                     self.pid_y.reset()
                     self.pid_z.reset()
+                    self.logger.info("刹车指令已发送（控制线程执行）")
+
+            # ---- 记录当前速度指令（供外部日志读取） ----
+            self._last_vx, self._last_vy, self._last_vz = vx, vy, vz
 
             # ---- ④ 通过 ZMQ 发送 VELOCITY SETPOINT（协议 §3.1 速度控制） ----
+            self.logger.debug("SETPOINT: control_mode=VELOCITY "
+                              "vx=%.2f vy=%.2f vz=%.2f", vx, vy, vz)
             ok, ack = self.proxy.send_setpoint(
                 vx=vx, vy=vy, vz=vz,
                 yaw_rate=0.0,
@@ -549,7 +601,7 @@ class UAVControlLoop:
             if not ok and self.running:
                 # ACK 失败记录日志，但不中断循环
                 # recv 超时或格式错误由 _send_req 内部恢复 REQ socket
-                pass
+                self.logger.warning("SETPOINT ACK 失败: %s", ack)
 
             # ---- ⑤ 精确控制循环频率（20Hz → 每 50ms） ----
             elapsed = time.time() - start
@@ -588,6 +640,9 @@ class UAVControlLoop:
         vz = self.pid_z.update(err_y)   # 上下移动（NED 中正为下）
         vx = 0.0                        # 前后维持不变
 
+        self.logger.debug("PID 计算: err_x=%.3f err_y=%.3f vy=%.3f vz=%.3f",
+                          err_x, err_y, vy, vz)
+
         # ---- 滑行预测期间：强制清空积分项 ----
         # 双重保险（update_detections 中也有一道）：
         # 确保 coast 帧只靠 PD 出力，积分项绝不充能
@@ -599,12 +654,13 @@ class UAVControlLoop:
 
     def stop(self):
         """停止控制线程，发送刹车指令，关闭 ZMQ 代理"""
+        self.logger.info("正在停止控制线程...")
         self.running = False
         if self.control_thread:
             self.control_thread.join(timeout=2.0)
 
         # 发送零速刹车指令
-        print("🛑 发送刹车指令...")
+        self.logger.info("发送刹车指令...")
         self.proxy.send_setpoint(
             vx=0.0, vy=0.0, vz=0.0,
             yaw_rate=0.0,
@@ -616,11 +672,21 @@ class UAVControlLoop:
         self._tracked_result = None
 
         self.proxy.close()
-        print("控制已停止，ZMQ 代理已关闭，跟踪器已重置")
+        self.logger.info("控制已停止，ZMQ 代理已关闭，跟踪器已重置")
 
 
 # ==================== 主程序入口 ======================
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('./log/npu_infer.log'),  # 写入文件
+            logging.StreamHandler()
+        ]
+    )
+    main_logger = logging.getLogger("Main")
+
     # 默认加载同目录下的 config.json
     config_file = "config.json"
 
@@ -628,12 +694,12 @@ def main():
     if len(sys.argv) > 1:
         config_file = sys.argv[1]
 
-    print(f"📖 正在从 {config_file} 加载系统配置...")
+    main_logger.info("正在从 %s 加载系统配置...", config_file)
     try:
         with open(config_file, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except Exception as e:
-        print(f"❌ 读取配置文件失败: {e}")
+        main_logger.error("读取配置文件失败: %s", e)
         sys.exit(1)
 
     # 实例化各子系统并注入配置
@@ -643,10 +709,10 @@ def main():
 
     # 启动无人机连接（RouterProxy 启动 + 起飞序列）
     if not controller.start_uav():
-        print("❌ 飞控启动失败，退出")
+        main_logger.error("飞控启动失败，退出")
         sys.exit(1)
 
-    print("🚀 NPU 精准推理 [ZMQ Router 协议版] 主循环启动...")
+    main_logger.info("NPU 精准推理 [ZMQ Router 协议版] 主循环启动...")
     loop_count = 0
 
     try:
@@ -721,27 +787,35 @@ def main():
             # 6. 周期性打印 Router + Tracker 状态（每 100 帧）
             if loop_count % 100 == 0:
                 state = controller.proxy.get_latest_state()
-                tracker_info = (f"  TK:{'✅' if tracked else '❌'}"
-                                f" ID:{track_res.get('primary_id','?')}"
-                                f" Lost:{track_res.get('lost_frames',0)}f"
-                                f" {'PRED' if track_res.get('is_predicted') else 'MEAS'}"
-                                f" Act:{track_res.get('n_active',0)}")
+                is_coast = track_res.get("is_predicted", False) if track_res else False
+                lost_frames = track_res.get("lost_frames", 0) if track_res else 0
+                n_active = track_res.get("n_active", 0) if track_res else 0
+                primary_id = track_res.get("primary_id", "?") if track_res else "?"
+                tracker_info = (f"TK:{'✅' if tracked else '❌'}"
+                                f" ID:{primary_id}"
+                                f" Lost:{lost_frames}f"
+                                f" {'PRED' if is_coast else 'MEAS'}"
+                                f" Act:{n_active}")
                 if state:
                     d = state["drone"]
                     age_us, _ = controller.proxy.get_state_freshness(state)
                     age_ms = (age_us or 0) / 1000
-                    print(f"📡 Router: mode={d['mode']} armed={d['armed']} "
-                          f"alt={d['alt_rel']:.1f}m spd={d['ground_speed']:.1f}m/s "
-                          f"batt={d['battery']:.0f}% age={age_ms:.0f}ms"
-                          f"{tracker_info}",
-                          end="" if loop_count % 500 != 0 else "\n")
+                    main_logger.info(
+                        "📡 Router: mode=%s armed=%s alt=%.1fm spd=%.1fm/s "
+                        "batt=%.0f%% age=%.0fms v=(%.1f,%.1f,%.1f) %s",
+                        d["mode"], d["armed"], d["alt_rel"],
+                        d["ground_speed"], d["battery"], age_ms,
+                        controller._last_vx, controller._last_vy,
+                        controller._last_vz, tracker_info
+                    )
 
     except KeyboardInterrupt:
-        print("\n👋 接收到终止信号，安全退出中...")
+        main_logger.info("接收到终止信号，安全退出中...")
+        print()  # 换行，使输出整洁
     finally:
         controller.stop()
         streamer.release()
-        print("程序运行结束。")
+        main_logger.info("程序运行结束。")
 
 
 if __name__ == "__main__":
