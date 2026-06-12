@@ -687,7 +687,13 @@ def main():
 
             # 追踪器锁定 → 绘制平滑框
             if tracked and track_res.get("box") is not None:
-                bx1, by1, bx2, by2 = track_res["box"]
+                box = track_res.get("box")
+                # 使用 np.clip 限制坐标，防止其画到屏幕外出现其他问题
+                h_img, w_img = orig_shape
+                bx1 = int(np.clip(box[0], 0, w_img-1))
+                by1 = int(np.clip(box[1], 0, h_img-1))
+                bx2 = int(np.clip(box[2], 0, w_img-1))
+                by2 = int(np.clip(box[3], 0, h_img-1))
                 is_coast = track_res.get("is_predicted", False)
                 box_color = (0, 255, 255) if is_coast else (0, 255, 0)   # COAST=黄, MEAS=绿
                 label = f"ID:{track_res.get('primary_id','?')}"
