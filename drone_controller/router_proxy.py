@@ -246,6 +246,7 @@ class RouterProxy:
         msg_id = msg.get("id", "?")
         summary = self._build_send_summary(msg)
         logger.debug("Sending %s id=%s: %s", msg_type, msg_id, summary)
+        logger.info("🚀 发送原始 JSON 指令: %s", json.dumps(msg))
         try:
             self.req.send_string(json.dumps(msg))
             ack_str = self.req.recv_string()
