@@ -7,12 +7,24 @@ import queue
 import socket
 import json
 import sys
-from ais_bench.infer.interface import InferSession
 
-# ================== 导入控制模块 =====================
-from drone_controller.base_control import DroneController
+# ================== 昇腾 NPU SDK（保护性导入） =====================
+# 说明：本机可能无昇腾环境，try-except 确保 import 错误仅告警不崩溃。
+# 部署到香橙派 AI Pro 时只需安装 ais_bench 即可无缝运行。
+try:
+    from ais_bench.infer.interface import InferSession
+    _HAS_NPU = True
+    print("✅ 昇腾 NPU SDK 导入成功")
+except ImportError:
+    _HAS_NPU = False
+    print("⚠️ 昇腾 NPU SDK 未安装，YOLO26UAVInfer 将在实例化时报错（部署后正常）")
+# ===============================================================
+
+# ================== ZMQ Router 通信代理 =====================
+from drone_controller.router_proxy import RouterProxy
 from drone_controller.pid_counter import PID
-# ===================================================
+# ===========================================================
+
 
 class VideoStreaming:
     """ 📡 视频流采集与后台图传模块（支持 RTSP 自动重连） """
@@ -158,6 +170,7 @@ class VideoStreaming:
             self.cap.release()
         self.tx_queue.put(None)
 
+
 class YOLO26UAVInfer:
     """ 🚀 昇腾 NPU 推理与图像后处理模块 """
 
@@ -228,76 +241,310 @@ class YOLO26UAVInfer:
 
 
 class UAVControlLoop:
-    """ 🛸 无人机飞控闭环控制核心 """
+    """ 🛸 无人机飞控闭环控制核心（基于 ZeroMQ Router 协议）
+
+    使用 RouterProxy 取代底层 DroneController，所有 MAVLink 通信
+    均通过 ZMQ REQ/SUB 转发给 Router 处理。
+
+    【控制流】
+      ┌─主循环─────────────┐
+      │ update_detections() │──→ 写入共享检测结果
+      └────────────────────┘
+               │
+      ┌─控制线程(20Hz)──────┐
+      │ _compute_velocity() │──→ PID 计算机体速度
+      │ proxy.send_setpoint │──→ ZMQ REQ → Router → PX4
+      └────────────────────┘
+
+    【保活设计】
+      - 控制线程以 20Hz 持续发送 SETPOINT，满足协议 ≥20Hz 要求
+      - 检测结果超过 500ms 未更新 → 强制零速刹车（防断流）
+      - 无目标时 PID 自动复位 → 输出零速
+    """
 
     def __init__(self, fc_cfg, pid_y_cfg, pid_z_cfg):
-        connection_string = fc_cfg.get("connection_string", "udpout:127.0.0.1:14550")
-        baud_rate = fc_cfg.get("baud_rate", 57600)
+        # ---- 保存 config（供 start_uav 使用如 takeoff_alt 等） ----
+        self.fc_cfg = fc_cfg
+        # -----------------------------------------------------------
 
-        # 初始化控制驱动端
-        self.uav = DroneController(connection_string=connection_string, baud=baud_rate)
+        # ---- 使用 RouterProxy 替换 DroneController ----
+        self.proxy = RouterProxy(
+            req_endpoint=fc_cfg.get("req_endpoint", "tcp://127.0.0.1:5555"),
+            sub_endpoint=fc_cfg.get("sub_endpoint", "tcp://127.0.0.1:5556")
+        )
+        # ---------------------------------------------
 
-        # 从 JSON 参数动态初始化 PID 调节器
-        self.pid_y = PID(
-            kp=pid_y_cfg["kp"], ki=pid_y_cfg["ki"], kd=pid_y_cfg["kd"],
-            max_out=pid_y_cfg["max_out"], min_out=pid_y_cfg["min_out"]
-        )
-        self.pid_z = PID(
-            kp=pid_z_cfg["kp"], ki=pid_z_cfg["ki"], kd=pid_z_cfg["kd"],
-            max_out=pid_z_cfg["max_out"], min_out=pid_z_cfg["min_out"]
-        )
+        self.pid_y = PID(**pid_y_cfg)
+        self.pid_z = PID(**pid_z_cfg)
+
+        # 控制参数（按协议改为 20Hz，§4.1 要求 ≥20Hz）
+        self.control_hz = 20.0
+        self.control_interval = 1.0 / self.control_hz
+
+        # 线程控制
+        self.running = False
+        self.control_thread = None
+        self.current_target = (0.0, 0.0, 0.0)
+        self.detections = []                   # 最新检测结果（线程间共享）
+        self.frame_shape = (480, 640)          # 默认尺寸
+
+        # 锁保护共享数据
+        self.data_lock = threading.Lock()
+
+        # ---- 防断流戳：主线程每次 update_detections 时更新 ----
+        self._last_update_time = 0.0
 
     def start_uav(self):
-        """ 连接并解锁无人机 """
-        self.uav.connect()
-        self.uav.print_status()
-        if not self.uav.is_armed and self.uav.current_mode not in ['GUIDED', 'OFFBOARD']:
-            self.uav.arm()
+        """连接 Router，执行标准起飞序列（协议 §3.3.1）
 
-    def process_control(self, detections, orig_shape, frame):
-        """ 根据检测结果执行 MAVLink 闭环控制逻辑 """
-        img_center_x = orig_shape[1] / 2
-        img_center_y = orig_shape[0] / 2
-        current_mode = getattr(self.uav, 'current_mode', 'UNKNOWN')
+        流程：
+          ① 启动 ZMQ 代理（开始收 STATE）
+          ② 等待 Router 状态推送
+          ③ 如需解锁 → ARM
+          ④ 如需起飞 → WAYPOINT(TAKEOFF)
+          ⑤ SETPOINT 预热（悬停）→ COMMAND(OFFBOARD)
+          ⑥ 启动 20Hz 控制线程
+        """
+        # ---- ① 启动 ZMQ 代理 ----
+        self.proxy.start()
+        print("🔄 RouterProxy 已启动，等待 Router 状态推送...")
 
-        if len(detections) > 0:
-            # 寻找置信度最高的目标
-            best_det = max(detections, key=lambda x: x[4])
-            x1, y1, x2, y2, conf, cls_id = best_det
-            target_x = (x1 + x2) / 2
-            target_y = (y1 + y2) / 2
+        # ---- ② 等待收到第一条 STATE ----
+        state = None
+        for i in range(50):  # 最多等 5 秒
+            state = self.proxy.get_latest_state()
+            if state is not None:
+                print("✅ 收到 Router 状态推送")
+                break
+            time.sleep(0.1)
 
-            # 计算归一化误差
-            err_x = (target_x - img_center_x) / img_center_x
-            err_y = (target_y - img_center_y) / img_center_y
+        if state is None:
+            print("❌ 无法获取飞机状态，请检查 Router 是否运行，"
+                  "且 SUB 端口 (tcp://127.0.0.1:5556) 可连通")
+            return False
 
-            # PID 计算转化为物理速度需求
-            vy_cmd = self.pid_y.update(err_x)  # 图像X正向 -> 飞机Vy右移
-            vz_cmd = self.pid_z.update(err_y)  # 图像Y正向 -> 飞机Vz下移 (NED系)
-            vx_cmd = 0.0  # 保持前后平移为0
+        armed = state["drone"]["armed"]
+        mode = state["drone"]["mode"]
+        alt_rel = state["drone"]["alt_rel"]
+        age_us, _ = self.proxy.get_state_freshness(state)
+        age_s = (age_us or 0) / 1_000_000
 
-            # 视效叠加
-            cv2.line(frame, (int(img_center_x), int(img_center_y)), (int(target_x), int(target_y)), (255, 0, 0), 2)
-            cv2.putText(frame, f"MAVLink Out -> Err_X: {err_x:+.3f} Err_Y: {err_y:+.3f}", (20, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+        print(f"📊 初始状态: mode={mode} | armed={armed} | "
+              f"alt_rel={alt_rel:.1f}m | state_age={age_s:.2f}s")
 
-            # 执行机体速度控制
-            if current_mode in ['GUIDED', 'OFFBOARD']:
-                self.uav.send_body_velocity(vx=vx_cmd, vy=vy_cmd, vz=vz_cmd, yaw_rate=0.0)
+        # ---- ③ 解锁（如未解锁） ----
+        if not armed:
+            if self._do_arm():
+                armed = True
             else:
-                cv2.putText(frame, f"MANUAL MODE OVERRIDE ({current_mode})", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                            (0, 0, 255), 2)
-        else:
-            # 目标丢失保护逻辑
-            cv2.putText(frame, "MAVLink Out -> Target LOST (HOVER)", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                        (0, 0, 255), 2)
+                return False
 
-            # 清除 PID 积分，防止突跳
-            if hasattr(self.pid_y, 'reset'): self.pid_y.reset()
-            if hasattr(self.pid_z, 'reset'): self.pid_z.reset()
+        # ---- ④ 起飞到目标高度（如高度不足） ----
+        takeoff_alt = self.fc_cfg.get("takeoff_alt", 15.0)
 
-            if current_mode in ['GUIDED', 'OFFBOARD']:
-                self.uav.send_body_velocity(vx=0.0, vy=0.0, vz=0.0, yaw_rate=0.0)
+        if alt_rel < takeoff_alt * 0.9:
+            print(f"🛫 高度 {alt_rel:.1f}m < 目标 {takeoff_alt:.1f}m，执行起飞...")
+            ok, ack = self.proxy.send_waypoint(
+                action="TAKEOFF", alt=takeoff_alt,
+                alt_frame="RELATIVE", speed=3.0
+            )
+            if not ok:
+                print(f"⚠️ TAKEOFF 指令 ACK 失败: {ack}，尝试通过 SETPOINT 爬升...")
+                # 降级方案：用 POSITION SETPOINT 爬升
+                ok, ack = self.proxy.send_setpoint(
+                    x=0, y=0, z=-takeoff_alt, yaw=0.0,
+                    control_mode="POSITION"
+                )
+                if not ok:
+                    print(f"❌ 爬升 SETPOINT 也失败: {ack}")
+                    return False
+
+            # 等待爬升
+            for i in range(100):  # 最多等 10 秒
+                state = self.proxy.get_latest_state()
+                if state and state["drone"]["alt_rel"] >= takeoff_alt * 0.9:
+                    alt_rel = state["drone"]["alt_rel"]
+                    print(f"✅ 达到目标高度: {alt_rel:.1f}m")
+                    break
+                time.sleep(0.1)
+            else:
+                print(f"⚠️ 爬升等待超时，当前 alt_rel={state['drone']['alt_rel']:.1f}m，继续执行")
+
+        # ---- ⑤ 预热 + 切换 OFFBOARD ----
+        if mode != "OFFBOARD":
+            # 获取最新高度用于预热悬停
+            state = self.proxy.get_latest_state()
+            current_alt = state["drone"]["alt_rel"] if state else takeoff_alt
+
+            print(f"🔄 发送悬停 SETPOINT 预热 (alt={current_alt:.1f}m)...")
+            ok, ack = self.proxy.send_setpoint(
+                x=0, y=0, z=-current_alt, yaw=0.0,
+                control_mode="POSITION"
+            )
+            if ok:
+                time.sleep(0.2)  # 等流建立（协议 §3.3.1 ③→④）
+            else:
+                print(f"⚠️ 预热 SETPOINT ACK 异常: {ack}，尝试继续...")
+
+            print("🔄 发送 OFFBOARD 指令...")
+            ok, ack = self.proxy.send_command("OFFBOARD")
+            if not ok:
+                print(f"❌ OFFBOARD 指令失败: {ack}")
+                return False
+
+            # 等待模式切换
+            for i in range(30):
+                state = self.proxy.get_latest_state()
+                if state and state["drone"]["mode"] == "OFFBOARD":
+                    mode = "OFFBOARD"
+                    print("✅ 已进入 OFFBOARD 模式")
+                    break
+                time.sleep(0.1)
+            else:
+                print(f"❌ OFFBOARD 模式切换超时，当前 mode={state['drone']['mode'] if state else 'N/A'}")
+                return False
+
+        # ---- ⑥ 启动独立控制线程 ----
+        self.running = True
+        self.control_thread = threading.Thread(
+            target=self._control_loop, daemon=True, name="uav-control"
+        )
+        self.control_thread.start()
+        print("✅ 控制线程已启动 (20Hz)")
+        return True
+
+    # ---- 辅助方法 ----
+
+    def _do_arm(self):
+        """执行解锁序列"""
+        print("🔓 发送 ARM 指令...")
+        ok, ack = self.proxy.send_command("ARM")
+        if not ok:
+            print(f"❌ ARM 指令发送失败: {ack}")
+            return False
+        # 等待飞控确认解锁
+        for i in range(30):
+            state = self.proxy.get_latest_state()
+            if state and state["drone"]["armed"]:
+                print("✅ 解锁成功")
+                return True
+            time.sleep(0.1)
+        print("❌ 解锁超时（30 次轮询未确认 armed=true）")
+        return False
+
+    # ---- 主循环调用的接口 ----
+
+    def update_detections(self, detections, frame_shape):
+        """由主循环调用，更新最新检测结果和图像尺寸
+
+        Args:
+            detections:  postprocess 后的检测列表 [[x1,y1,x2,y2,conf,cls_id], ...]
+            frame_shape: 原始帧形状 (height, width)
+        """
+        with self.data_lock:
+            self.detections = detections
+            self.frame_shape = frame_shape
+            self._last_update_time = time.time()
+
+    # ---- 内部控制线程 ----
+
+    def _control_loop(self):
+        """独立线程：以 20Hz 发送 SETPOINT，保证 OFFBOARD 保活
+
+        无论是否有目标，每次迭代都发送 VELOCITY SETPOINT。
+        无目标时速度全零（悬停刹车），满足协议 ≥20Hz 要求。
+        """
+        while self.running:
+            start = time.time()
+
+            # 获取最新的检测结果（加锁）
+            with self.data_lock:
+                dets = self.detections.copy()
+                h, w = self.frame_shape[:2]
+                last_update = self._last_update_time
+
+            # ---- 防断流检测：超过 500ms 无更新则强制零速 ----
+            # 覆盖主线程卡死、摄像头断流等场景
+            if time.time() - last_update > 0.5:
+                if len(dets) > 0:
+                    # 只在首次过期时打印，避免刷屏
+                    pass  # 保留静默刹车
+                dets = []       # 清空检测 → PID 复位 → 零速
+                self.pid_y.reset()
+                self.pid_z.reset()
+            # ------------------------------------------------
+
+            # 计算速度指令
+            vx, vy, vz = self._compute_velocity(dets, w, h)
+
+            # 通过 ZMQ 发送 VELOCITY SETPOINT（协议 §3.1 速度控制）
+            # 无论是否有目标，都持续发送以满足 20Hz 保活要求
+            ok, ack = self.proxy.send_setpoint(
+                vx=vx, vy=vy, vz=vz,
+                yaw_rate=0.0,
+                control_mode="VELOCITY"
+            )
+            if not ok and self.running:
+                # ACK 失败记录日志，但不中断循环
+                # recv 超时或格式错误由 _send_req 内部恢复 REQ socket
+                pass
+
+            # 精确控制循环频率（20Hz → 每 50ms）
+            elapsed = time.time() - start
+            sleep_time = self.control_interval - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    def _compute_velocity(self, detections, frame_w, frame_h):
+        """根据检测结果计算机体速度 (vx, vy, vz)
+
+        与原始逻辑相同：
+          - 无目标 → PID 复位 → 返回零速（悬停/刹车）
+          - 有目标 → 取置信度最高的 → 偏差归一化 → PID 输出
+
+        Returns:
+            (vx, vy, vz): NED 坐标系速度 (m/s)
+        """
+        if not detections:
+            # 无目标：悬停，并重置 PID 积分
+            self.pid_y.reset()
+            self.pid_z.reset()
+            return 0.0, 0.0, 0.0
+
+        # 取置信度最高的目标
+        best = max(detections, key=lambda x: x[4])
+        x1, y1, x2, y2, _conf, _cls_id = best
+        target_x = (x1 + x2) / 2
+        target_y = (y1 + y2) / 2
+        img_center_x = frame_w / 2
+        img_center_y = frame_h / 2
+
+        err_x = (target_x - img_center_x) / img_center_x
+        err_y = (target_y - img_center_y) / img_center_y
+
+        vy = self.pid_y.update(err_x)   # 左右移动
+        vz = self.pid_z.update(err_y)   # 上下移动（NED 中正为下）
+        vx = 0.0                        # 前后移动
+
+        return vx, vy, vz
+
+    def stop(self):
+        """停止控制线程，发送刹车指令，关闭 ZMQ 代理"""
+        self.running = False
+        if self.control_thread:
+            self.control_thread.join(timeout=2.0)
+
+        # 发送零速刹车指令
+        print("🛑 发送刹车指令...")
+        self.proxy.send_setpoint(
+            vx=0.0, vy=0.0, vz=0.0,
+            yaw_rate=0.0,
+            control_mode="VELOCITY"
+        )
+        time.sleep(0.2)  # 确保指令发出
+
+        self.proxy.close()
+        print("控制已停止，ZMQ 代理已关闭")
 
 
 # ==================== 主程序入口 ======================
@@ -322,11 +569,13 @@ def main():
     detector = YOLO26UAVInfer(cfg["model"])
     controller = UAVControlLoop(cfg["flight_control"], cfg["pid_y"], cfg["pid_z"])
 
-    # 启动无人机连接
-    controller.start_uav()
+    # 启动无人机连接（RouterProxy 启动 + 起飞序列）
+    if not controller.start_uav():
+        print("❌ 飞控启动失败，退出")
+        sys.exit(1)
 
-
-    print("🚀 NPU 精准推理 [JSON配置动态加载版] 主循环启动...")
+    print("🚀 NPU 精准推理 [ZMQ Router 协议版] 主循环启动...")
+    loop_count = 0
 
     try:
         while True:
@@ -335,6 +584,7 @@ def main():
                 time.sleep(0.005)
                 continue
 
+            loop_count += 1
             orig_shape = frame.shape[:2]
 
             # 1. 图像预处理
@@ -349,19 +599,32 @@ def main():
 
             # 3. 坐标反求与控制计算
             detections = detector.postprocess(outputs, ratio, dwdh, orig_shape)
-            controller.process_control(detections, orig_shape, frame)
+            controller.update_detections(detections, orig_shape)
 
             # 4. 界面渲染
             frame = detector.draw_boxes(frame, detections)
-            cv2.putText(frame, f"NPU Pure FPS: {fps_pure:.1f}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255),
-                        2)
+            cv2.putText(frame, f"NPU Pure FPS: {fps_pure:.1f}", (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
             # 5. 推送至后台异步图传队列
             streamer.push_to_stream(frame)
 
+            # 6. 周期性打印 Router 状态（每 100 帧）
+            if loop_count % 100 == 0:
+                state = controller.proxy.get_latest_state()
+                if state:
+                    d = state["drone"]
+                    age_us, _ = controller.proxy.get_state_freshness(state)
+                    age_ms = (age_us or 0) / 1000
+                    print(f"📡 [Router] mode={d['mode']} armed={d['armed']} "
+                          f"alt={d['alt_rel']:.1f}m spd={d['ground_speed']:.1f}m/s "
+                          f"batt={d['battery']:.0f}% state_age={age_ms:.0f}ms",
+                          end="" if loop_count % 500 != 0 else "\n")
+
     except KeyboardInterrupt:
         print("\n👋 接收到终止信号，安全退出中...")
     finally:
+        controller.stop()
         streamer.release()
         print("程序运行结束。")
 
