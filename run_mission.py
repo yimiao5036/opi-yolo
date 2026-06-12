@@ -1,55 +1,426 @@
+"""
+run_mission.py — 基于 ZMQ Router 协议的主任务入口
+
+【架构概览】
+  本脚本是整个无人机任务系统的总装粘合剂。采用领域驱动模块化设计，
+  将各子系统按职责独立实例化，在主循环中进行控制权协调。
+
+    ┌─ MissionManager ────────────┐
+    │  RouterProxy (own)          │  状态机管理 + 航点巡航
+    │  POSITION SETPOINT (非追踪) │  控制权：NAVIGATING/HOLD_TASK/...
+    └─────────────────────────────┘
+              ↕ 控制权协调
+    ┌─ UAVControlLoop ────────────┐
+    │  RouterProxy (own)          │  20Hz VELOCITY 闭环追踪
+    │  TargetTracker + PID        │  控制权：仅 VISUAL_TRACKING
+    └─────────────────────────────┘
+    ┌─ 感知模块 ───────────────────┐
+    │  VideoStreaming             │  摄像头/RTSP 采集
+    │  YOLO26UAVInfer             │  昇腾 NPU 推理
+    └─────────────────────────────┘
+
+【控制权协调规则】
+  同一时刻只有一个人持有「SETPOINT 发令权」：
+    - VISUAL_TRACKING 之外 → MissionManager 发 POSITION SETPOINT
+    - VISUAL_TRACKING 之中 → UAVControlLoop 线程发 VELOCITY SETPOINT
+    - 切换由主循环检测 MissionManager.state 变化时触发
+
+【安全设计】
+    - try / except FailsafeTriggered / finally 全面资源释放
+    - 两个独立 RouterProxy，避免 REQ socket 线程竞争
+    - 控制线程启停由状态机状态变化驱动，逻辑可预测
+
+【可扩展的图像输入接口】
+    如需替换视频源（如模拟器/录播文件），替换 VideoStreaming 实例
+    即可，保持 read_frame() → (ret, frame) 的协议不变。
+"""
+
+import os
+import sys
 import time
 import json
-from drone_controller.base_control import DroneController
-from drone_controller.mission_manager import MissionManager, FailsafeTriggered
+import logging
+import threading
 
-# 1. 定义室内台架或室内试验场的相对局部航点 (X=北, Y=东, Z=地, yaw=偏航角)
-# 注意：NED 坐标系下，Z轴向上为负数！
-flight_waypoints = [
-    {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},  # 航点 1：向前 1 米，维持高度 1.5 米
-    {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},  # 航点 2：向右平移 1 米，机头转向正东
-    {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},  # 航点 3：回到原点上方，高度降到 1.2 米
-]
+import cv2
 
-def load_config(config_path="./config.json"):
-    with open(config_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ---- ZMQ Router 代理与状态机 ----
+from drone_controller.router_proxy import RouterProxy
+from drone_controller.mission_manager import (
+    MissionManager,
+    MissionState,
+    FailsafeTriggered,
+)
 
+# ---- 视觉闭环控制（复用 infer_camera_modular 现有实现） ----
+# 注意：此处不修改 UAVControlLoop 任何内部逻辑。
+# run_mission.py 在外部协调其控制线程的启停。
+from infer_camera_modular import UAVControlLoop, VideoStreaming, YOLO26UAVInfer
+
+logger = logging.getLogger("RunMission")
+
+
+class MissionOrchestrator:
+    """
+    🎯 全任务编排器
+
+    职责：
+      1. 创建并初始化所有子系统
+      2. 在主循环中协调 MissionManager 状态机与 UAVControlLoop 的控制权
+      3. 处理 Failsafe 熔断、键盘中断等异常退出
+      4. 提供标准视频源接口（可替换）
+    """
+
+    def __init__(self, config_path="./config.json"):
+        self.logger = logging.getLogger("Orchestrator")
+        self.logger.info("正在加载配置: %s", config_path)
+
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        self.cfg = cfg
+
+        # ---- 感知子系统 ----
+        self.streamer = VideoStreaming(cfg["video"], cfg["network"])
+        self.detector = YOLO26UAVInfer(cfg["model"])
+
+        # ---- 航线定义（NED 坐标系，Z 向上为负） ----
+        self.waypoints = [
+            {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},
+            {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},
+            {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},
+        ]
+
+        # ================================================================
+        #  🚁 MissionManager（状态机 + 航点巡航）
+        # ================================================================
+        # 拥有独立的 RouterProxy，用于读取 STATE 和发送 COMMAND /
+        # WAYPOINT / POSITION SETPOINT。
+        fc = cfg["flight_control"]
+        self.mission_proxy = RouterProxy(
+            req_endpoint=fc.get("req_endpoint", "tcp://127.0.0.1:5555"),
+            sub_endpoint=fc.get("sub_endpoint", "tcp://127.0.0.1:5556"),
+        )
+
+        self.mission = MissionManager(
+            proxy=self.mission_proxy,
+            waypoints=self.waypoints,
+            target_altitude=1.5,
+            arrival_radius=0.3,
+            hold_duration=8.0,
+            return_to_home=False,
+        )
+
+        # ================================================================
+        #  🛸 UAVControlLoop（20Hz VELOCITY 闭环追踪）
+        # ================================================================
+        # 拥有独立的 RouterProxy。其 20Hz 控制线程仅在 VISUAL_TRACKING
+        # 期间运行，其余时间处于停止状态，避免与 MissionManager 冲突。
+        self.controller = UAVControlLoop(
+            cfg["flight_control"], cfg["pid_y"], cfg["pid_z"],
+        )
+        self._control_active = False   # 控制线程运行标志
+
+        # ---- 主循环参数 ----
+        self.running = False
+        self.loop_interval = 0.05      # 20Hz
+
+        self.logger.info("MissionOrchestrator 初始化完成")
+
+    # ================================================================
+    #  🔌 启动
+    # ================================================================
+
+    def start(self):
+        """启动所有子系统"""
+        self.logger.info("正在启动所有子系统...")
+
+        # 1. 启动 MissionManager 的 ZMQ 代理（SUB 监听 + REQ 就绪）
+        self.mission_proxy.start()
+        self.logger.info("✔ MissionManager Proxy 已启动")
+
+        # 2. 启动 UAVControlLoop 的 ZMQ 代理
+        #    start_uav() 会执行完整的起飞序列，我们不需要 ——
+        #    MissionManager 负责起飞。这里只启动 SUB 线程收 STATE。
+        self.controller.proxy.start()
+        self.logger.info("✔ UAVControlLoop Proxy 已启动")
+
+        # 3. 等待收到第一条 Router STATE
+        self._wait_for_initial_state()
+
+        self.running = True
+        self.logger.info("🚀 所有子系统就绪，主循环启动")
+
+    def _wait_for_initial_state(self, timeout=5.0):
+        """等待 Router 推送第一条 STATE"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            state = self.mission_proxy.get_latest_state()
+            if state is not None:
+                drone = state.get("drone", {})
+                self.logger.info(
+                    "✔ 收到 Router 状态: mode=%s armed=%s alt=%.1fm",
+                    drone.get("mode"), drone.get("armed"),
+                    drone.get("alt_rel", 0),
+                )
+                return True
+            time.sleep(0.1)
+        self.logger.warning("⚠ 未收到 Router 状态 (%ds 超时)，继续启动...", timeout)
+        return False
+
+    # ================================================================
+    #  🔁 主循环
+    # ================================================================
+
+    def run(self):
+        """主业务循环（20Hz）"""
+        self.logger.info("主循环开始 (20Hz)")
+
+        prev_state = MissionState.INIT
+        loop_count = 0
+
+        try:
+            while self.running:
+                loop_start = time.time()
+
+                # ---- ① 读取视频帧 ----
+                ret, frame = self.streamer.read_frame()
+                if not ret:
+                    # 无新帧时短暂等待，不浪费 CPU
+                    time.sleep(0.005)
+                    continue
+
+                loop_count += 1
+                orig_shape = frame.shape[:2]
+
+                # ---- ② NPU 推理 + 后处理 ----
+                input_tensor, ratio, dwdh = self.detector.preprocess(frame)
+                outputs = self.detector.session.infer([input_tensor])
+                detections = self.detector.postprocess(
+                    outputs, ratio, dwdh, orig_shape,
+                )
+                target_detected = len(detections) > 0
+
+                # ---- ③ 控制权协调 ----
+                # 根据当前状态机 state 决定 UAVControlLoop 控制线程启停
+                current_state = self.mission.state
+                self._coordinate_control(current_state, prev_state,
+                                         detections, orig_shape)
+                prev_state = current_state
+
+                # ---- ④ 状态机更新 ----
+                self.mission.update(target_detected=target_detected)
+
+                # ---- ⑤ HUD 渲染 + 图传 ----
+                frame = self._render_hud(frame, loop_count, detections)
+                self.streamer.push_to_stream(frame)
+
+                # ---- 频率控制 ----
+                elapsed = time.time() - loop_start
+                sleep_time = self.loop_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        except FailsafeTriggered as e:
+            # Failsafe 熔断：安全员切出手动模式 → 程序安全退出
+            self.logger.warning("🚨 [Failsafe] %s", e)
+        except KeyboardInterrupt:
+            self.logger.info("⌨ 用户键盘中断，正在安全退出...")
+        except Exception as e:
+            self.logger.exception("💥 主循环异常: %s", e)
+        finally:
+            self.shutdown()
+
+    # ================================================================
+    #  控制权协调
+    # ================================================================
+
+    def _coordinate_control(self, current_state, prev_state,
+                            detections, orig_shape):
+        """
+        控制权协调：基于状态机状态启停 UAVControlLoop 线程
+
+        ┌──────────────┬─────────────────────┬──────────────────────┐
+        │ 状态机状态    │ MissionManager      │ UAVControlLoop       │
+        ├──────────────┼─────────────────────┼──────────────────────┤
+        │ 非 TRACKING  │ proxy → POSITION    │ 控制线程已停止        │
+        │              │   SETPOINT          │                      │
+        ├──────────────┼─────────────────────┼──────────────────────┤
+        │ TRACKING     │ 不发 SETPOINT       │ 20Hz VELOCITY 线程   │
+        │              │ (控制权已让渡)       │ TargetTracker + PID  │
+        └──────────────┴─────────────────────┴──────────────────────┘
+        """
+        is_tracking = current_state == MissionState.VISUAL_TRACKING
+        was_tracking = prev_state == MissionState.VISUAL_TRACKING
+
+        if is_tracking:
+            # ---- 进入 VISUAL_TRACKING → 启动/保持控制线程 ----
+            if not self._control_active:
+                self._start_control_thread()
+
+            # 不断喂入检测数据（TargetTracker 在主线程更新）
+            self.controller.update_detections(detections, orig_shape)
+
+        else:
+            # ---- 非 VISUAL_TRACKING → 停止控制线程 ----
+            if self._control_active:
+                self._stop_control_thread()
+
+            # 非追踪期间也喂入空检测，保持数据结构新鲜
+            self.controller.update_detections([], orig_shape)
+
+    def _start_control_thread(self):
+        """启动 UAVControlLoop 的 20Hz VELOCITY 控制线程"""
+        self.logger.info("▶ [控制权] 启动 UAVControlLoop VELOCITY 线程")
+
+        # 记录进入追踪时的飞机状态
+        state = self.mission_proxy.get_latest_state()
+        if state:
+            d = state.get("drone", {})
+            self.logger.info("追踪初始状态: mode=%s alt=%.1fm armed=%s",
+                             d.get("mode"), d.get("alt_rel", 0),
+                             d.get("armed"))
+
+        # 直接复用 UAVControlLoop 已有的内部 _control_loop 方法
+        # （不修改任何内部逻辑，仅从外部启动其线程）
+        self.controller.running = True
+        self.controller.control_thread = threading.Thread(
+            target=self.controller._control_loop,
+            daemon=True,
+            name="uav-vel-control",
+        )
+        self.controller.control_thread.start()
+        self._control_active = True
+
+    def _stop_control_thread(self):
+        """安全停止 UAVControlLoop 的控制线程"""
+        if not self._control_active:
+            return
+
+        self.logger.info("⏹ [控制权] 停止 UAVControlLoop 线程")
+        self.controller.running = False
+
+        if self.controller.control_thread:
+            self.controller.control_thread.join(timeout=2.0)
+            self.controller.control_thread = None
+
+        # 复位 PID 积分项和跟踪器，避免下次启动时积分暴冲
+        self.controller.pid_y.reset()
+        self.controller.pid_z.reset()
+        self.controller.tracker.reset()
+        self._control_active = False
+        self.logger.info("✔ 控制线程已停止，PID/跟踪器已重置")
+
+    # ================================================================
+    #  渲染
+    # ================================================================
+
+    def _render_hud(self, frame, loop_count, detections):
+        """
+        在视频帧上叠加 HUD 信息
+
+        包含：状态机阶段、航点索引、控制权归属、检测结果
+        """
+        # ---- 检测框 ----
+        frame = self.detector.draw_boxes(frame, detections)
+
+        # ---- 状态面板 ----
+        state_name = self.mission.state.name
+        wp_text = f"WP: {self.mission.current_wp_index + 1}/{len(self.waypoints)}"
+        ctrl_text = "CTRL:VELOCITY" if self._control_active else "CTRL:POSITION"
+
+        cv2.putText(frame, f"State: {state_name} | {wp_text}",
+                    (20, 40), cv2.FONT_HERSHEY_COMPLEX, 0.6,
+                    (0, 255, 255), 2)
+        cv2.putText(frame, ctrl_text,
+                    (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 255, 0) if self._control_active else (255, 255, 0), 2)
+
+        # ---- 每 100 帧打印详细状态日志 ----
+        if loop_count % 100 == 0:
+            state = self.mission_proxy.get_latest_state()
+            if state:
+                d = state.get("drone", {})
+                self.logger.info(
+                    "📡 mode=%s armed=%s alt=%.1fm spd=%.1f bat=%.0f%% "
+                    "%s %s detect=%d",
+                    d.get("mode"), d.get("armed"),
+                    d.get("alt_rel", 0), d.get("ground_speed", 0),
+                    d.get("battery", 0),
+                    state_name, ctrl_text,
+                    len(detections),
+                )
+
+        return frame
+
+    # ================================================================
+    #  🧹 资源释放
+    # ================================================================
+
+    def shutdown(self):
+        """
+        安全关闭所有子系统
+
+        释放顺序（逆初始化顺序）：
+          1. 停止控制线程
+          2. 关闭 MissionManager 的 ZMQ 代理
+          3. 关闭 UAVControlLoop 的 ZMQ 代理
+          4. 释放视频流资源
+        """
+        self.logger.info("====== 安全关闭所有子系统 ======")
+        self.running = False
+
+        # 1. 停止控制线程
+        self._stop_control_thread()
+
+        # 2. 关闭 MissionManager 的 Proxy
+        try:
+            self.mission_proxy.close()
+            self.logger.info("✔ MissionManager Proxy 已关闭")
+        except Exception as e:
+            self.logger.warning("mission_proxy close 异常: %s", e)
+
+        # 3. 关闭 UAVControlLoop 的 Proxy（直接访问其内部 proxy）
+        try:
+            self.controller.proxy.close()
+            self.logger.info("✔ UAVControlLoop Proxy 已关闭")
+        except Exception as e:
+            self.logger.warning("control_proxy close 异常: %s", e)
+
+        # 4. 释放视频资源
+        try:
+            self.streamer.release()
+            self.logger.info("✔ VideoStreamer 已释放")
+        except Exception as e:
+            self.logger.warning("streamer release 异常: %s", e)
+
+        self.logger.info("🏁 所有资源已安全释放，程序退出")
+
+
+# ================================================================
+#  入口
+# ================================================================
 
 def main():
-    # 加载配置
-    config = load_config()
-    cfg = config["flight_control"]
-    # 2. 初始化底层 SDK 驱动
-    uav = DroneController(connection_string=cfg.get("connection_string"), baud=cfg.get("baud_rate"))
-    if not uav.connect():
-        print("物理串口打开失败，请检查数传连接或端口权限。")
-        return
+    """主入口：日志配置 → 编排器创建 → 启动 → 运行"""
+    # 创建日志目录
+    os.makedirs("./log", exist_ok=True)
 
-    # 3. 实例化任务管理器 (设置到达半径为0.3米，每个点悬停3秒)
-    manager = MissionManager(drone=uav, waypoints=flight_waypoints, target_altitude=1.5, arrival_radius=0.3,
-                             hold_duration=3.0)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("./log/mission_run.log", mode="a"),
+        ],
+    )
 
-    print("=================== 巡航控制系统启动 ===================")
-    try:
-        # 高频业务控制主循环 (10Hz)
-        while True:
-            # 轮询状态机
-            is_finished = manager.update()
-            if is_finished:
-                print("=================== 整个巡航任务已安全退出 ===================")
-                break
+    # 允许命令行指定配置文件路径
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "./config.json"
 
-            time.sleep(0.1)  # 严格的 10Hz 轮询，配合管理器内部 5Hz 下发，完美防失控
-
-    except FailsafeTriggered as e:
-        # 4. 最强安全保护：一旦遥控器切出模式，代码在这里捕获，直接结束整个 Python 进程
-        print(f"\n🚨 [主循环紧急熔断] 系统安全退出: {e}。香橙派已处于安全挂起状态，不占用串口输出。")
-    except KeyboardInterrupt:
-        print("\n用户手动通过 Ctrl+C 终止了上位机脚本。")
-    finally:
-        uav.running = False  # 销毁并关闭底层遥测监听守护线程
+    orchestrator = MissionOrchestrator(config_path=config_file)
+    orchestrator.start()
+    orchestrator.run()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

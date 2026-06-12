@@ -20,7 +20,7 @@ conda activate base
 # ====================================================================
 
 WORK_DIR="/home/HwHiAiUser/opi-yolo"
-PYTHON_SCRIPT="infer_camera_direct.py"
+PYTHON_SCRIPT="infer_camera_modular.py"
 LOG_FILE="/tmp/npu_infer.log"
 
 PYTHON_BIN="python3"
