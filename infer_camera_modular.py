@@ -23,6 +23,7 @@ except ImportError:
 # ================== ZMQ Router 通信代理 =====================
 from drone_controller.router_proxy import RouterProxy
 from drone_controller.pid_counter import PID
+from drone_controller.target_tracker import TargetTracker
 # ===========================================================
 
 
@@ -277,6 +278,17 @@ class UAVControlLoop:
         self.pid_y = PID(**pid_y_cfg)
         self.pid_z = PID(**pid_z_cfg)
 
+        # ---- 轻量级目标追踪过滤器 ----
+        # 平滑 YOLO 检测、稳定 ID、coast 预测
+        tracker_cfg = fc_cfg.get("target_tracker", {})
+        self.tracker = TargetTracker(
+            max_lost_frames=tracker_cfg.get("max_lost_frames", 8),
+            max_association_dist=tracker_cfg.get("max_association_dist", 200.0),
+            min_hits=tracker_cfg.get("min_hits", 3),
+        )
+        self._tracked_result = None   # 跟踪结果（锁保护）
+        # ------------------------------------------------
+
         # 控制参数（按协议改为 20Hz，§4.1 要求 ≥20Hz）
         self.control_hz = 20.0
         self.control_interval = 1.0 / self.control_hz
@@ -285,7 +297,7 @@ class UAVControlLoop:
         self.running = False
         self.control_thread = None
         self.current_target = (0.0, 0.0, 0.0)
-        self.detections = []                   # 最新检测结果（线程间共享）
+        self.detections = []                   # 最新检测结果（仅用于渲染，线程间共享）
         self.frame_shape = (480, 640)          # 默认尺寸
 
         # 锁保护共享数据
@@ -293,6 +305,9 @@ class UAVControlLoop:
 
         # ---- 防断流戳：主线程每次 update_detections 时更新 ----
         self._last_update_time = 0.0
+
+        # ---- 安全刹车请求标志（主线程判丢 → 控制线程执行刹车） ----
+        self._brake_requested = False
 
     def start_uav(self):
         """连接 Router，执行标准起飞序列（协议 §3.3.1）
@@ -437,19 +452,62 @@ class UAVControlLoop:
     def update_detections(self, detections, frame_shape):
         """由主循环调用，更新最新检测结果和图像尺寸
 
+        处理流程：
+          1. 用 YOLO 原始检测更新 TargetTracker（获取平滑/预测结果）
+          2. Coast 滑行期间 → PID 积分清空（只靠 PD 稳住，不充积分）
+          3. 判定彻底丢失 → 请求控制线程执行安全零速刹车
+          4. 将结果写入线程安全共享区，供控制线程消费
+
         Args:
             detections:  postprocess 后的检测列表 [[x1,y1,x2,y2,conf,cls_id], ...]
             frame_shape: 原始帧形状 (height, width)
+
+        Returns:
+            (tracked: bool, result: dict)
+            — tracked:  当前是否存在有效主目标
+            — result:   跟踪器完整输出（含 center, box, is_predicted, lost_frames 等）
         """
+        # ---- 跟踪过滤器：处理原始检测，输出平滑中心点 ----
+        # 计算在锁外进行，避免阻塞控制线程（Kalman 计算 < 0.1ms 量级）
+        result = self.tracker.update(detections, frame_shape)
+        tracked = result.get("tracked", False)
+        # ------------------------------------------------
+
+        # ---- ① Coast 滑行期间：PID 积分清空 ----
+        # 卡尔曼预测阶段目标可能漂移，积分项在此累积会导致
+        # 目标重获瞬间积分暴冲（I-term windup）
+        if tracked and result.get("is_predicted"):
+            self.pid_y.reset_integral()
+            self.pid_z.reset_integral()
+
+        # ---- ② 目标彻底丢失：请求控制线程执行刹车 ----
+        # 注意：不在此处直接调 proxy.send_setpoint 以避免 REQ-REP
+        # 并发冲突（控制线程也在使用同一 REQ socket），改用标志位
+        # 由控制线程在下一 20Hz 周期拾取并发送刹车指令
+        if not tracked:
+            self.pid_y.reset_integral()
+            self.pid_z.reset_integral()
+            with self.data_lock:
+                self._brake_requested = True
+
         with self.data_lock:
             self.detections = detections
             self.frame_shape = frame_shape
             self._last_update_time = time.time()
+            self._tracked_result = result
+
+        return tracked, result
 
     # ---- 内部控制线程 ----
 
     def _control_loop(self):
         """独立线程：以 20Hz 发送 SETPOINT，保证 OFFBOARD 保活
+
+        控制流：
+          1. 读取 TargetTracker 的平滑结果（免锁快照）
+          2. 防断流检测（主线程 500ms 无更新 → 强制判丢）
+          3. 跟踪器判丢 → PID 复位 → 零速刹车
+          4. 跟踪器锁定 → 用平滑中心点计算 PID → VELOCITY SETPOINT
 
         无论是否有目标，每次迭代都发送 VELOCITY SETPOINT。
         无目标时速度全零（悬停刹车），满足协议 ≥20Hz 要求。
@@ -457,28 +515,32 @@ class UAVControlLoop:
         while self.running:
             start = time.time()
 
-            # 获取最新的检测结果（加锁）
+            # ---- ① 读取跟踪结果和帧尺寸（加锁快照） ----
             with self.data_lock:
-                dets = self.detections.copy()
+                tracked = self._tracked_result
                 h, w = self.frame_shape[:2]
                 last_update = self._last_update_time
 
-            # ---- 防断流检测：超过 500ms 无更新则强制零速 ----
-            # 覆盖主线程卡死、摄像头断流等场景
+            # ---- ② 防断流检测 ----
+            # 主线程超过 500ms 未更新 → 强制判丢（覆盖摄像头断流/主线程卡死）
             if time.time() - last_update > 0.5:
-                if len(dets) > 0:
-                    # 只在首次过期时打印，避免刷屏
-                    pass  # 保留静默刹车
-                dets = []       # 清空检测 → PID 复位 → 零速
-                self.pid_y.reset()
-                self.pid_z.reset()
-            # ------------------------------------------------
+                tracked = None
 
-            # 计算速度指令
-            vx, vy, vz = self._compute_velocity(dets, w, h)
+            # ---- ③ 解析跟踪结果 → 速度指令（使用跟踪器输出的平滑中心点） ----
+            vx, vy, vz = self._velocity_from_tracker(tracked, w, h)
 
-            # 通过 ZMQ 发送 VELOCITY SETPOINT（协议 §3.1 速度控制）
-            # 无论是否有目标，都持续发送以满足 20Hz 保活要求
+            # ---- ③' 安全刹车请求：主线程判丢时紧急抱闸 ----
+            # update_detections 检测到目标彻底丢失后设置此标志，
+            # 控制线程在此拾取并执行一次全零 VELOCITY 刹车
+            with self.data_lock:
+                if self._brake_requested:
+                    self._brake_requested = False
+                    vx, vy, vz = 0.0, 0.0, 0.0
+                    # 同时清空 PID（确保 PD 也归零）
+                    self.pid_y.reset()
+                    self.pid_z.reset()
+
+            # ---- ④ 通过 ZMQ 发送 VELOCITY SETPOINT（协议 §3.1 速度控制） ----
             ok, ack = self.proxy.send_setpoint(
                 vx=vx, vy=vy, vz=vz,
                 yaw_rate=0.0,
@@ -489,42 +551,49 @@ class UAVControlLoop:
                 # recv 超时或格式错误由 _send_req 内部恢复 REQ socket
                 pass
 
-            # 精确控制循环频率（20Hz → 每 50ms）
+            # ---- ⑤ 精确控制循环频率（20Hz → 每 50ms） ----
             elapsed = time.time() - start
             sleep_time = self.control_interval - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
 
-    def _compute_velocity(self, detections, frame_w, frame_h):
-        """根据检测结果计算机体速度 (vx, vy, vz)
+    def _velocity_from_tracker(self, tracked, frame_w, frame_h):
+        """
+        根据跟踪器输出计算机体速度 (vx, vy, vz)
 
-        与原始逻辑相同：
-          - 无目标 → PID 复位 → 返回零速（悬停/刹车）
-          - 有目标 → 取置信度最高的 → 偏差归一化 → PID 输出
+        这是控制线程使用的唯一速度计算路径。
+        平滑后的中心点 → 归一化误差 → PID 输出。
+
+        Args:
+            tracked:  tracker.update() 返回的 result dict（或 None）
+            frame_w:  画面宽度（像素）
+            frame_h:  画面高度（像素）
 
         Returns:
             (vx, vy, vz): NED 坐标系速度 (m/s)
         """
-        if not detections:
-            # 无目标：悬停，并重置 PID 积分
+        if tracked is None or not tracked.get("tracked"):
             self.pid_y.reset()
             self.pid_z.reset()
             return 0.0, 0.0, 0.0
 
-        # 取置信度最高的目标
-        best = max(detections, key=lambda x: x[4])
-        x1, y1, x2, y2, _conf, _cls_id = best
-        target_x = (x1 + x2) / 2
-        target_y = (y1 + y2) / 2
-        img_center_x = frame_w / 2
-        img_center_y = frame_h / 2
+        cx, cy = tracked["center"]
+        img_cx = frame_w / 2.0
+        img_cy = frame_h / 2.0
 
-        err_x = (target_x - img_center_x) / img_center_x
-        err_y = (target_y - img_center_y) / img_center_y
+        err_x = (cx - img_cx) / img_cx
+        err_y = (cy - img_cy) / img_cy
 
         vy = self.pid_y.update(err_x)   # 左右移动
         vz = self.pid_z.update(err_y)   # 上下移动（NED 中正为下）
-        vx = 0.0                        # 前后移动
+        vx = 0.0                        # 前后维持不变
+
+        # ---- 滑行预测期间：强制清空积分项 ----
+        # 双重保险（update_detections 中也有一道）：
+        # 确保 coast 帧只靠 PD 出力，积分项绝不充能
+        if tracked.get("is_predicted"):
+            self.pid_y.reset_integral()
+            self.pid_z.reset_integral()
 
         return vx, vy, vz
 
@@ -543,8 +612,11 @@ class UAVControlLoop:
         )
         time.sleep(0.2)  # 确保指令发出
 
+        self.tracker.reset()
+        self._tracked_result = None
+
         self.proxy.close()
-        print("控制已停止，ZMQ 代理已关闭")
+        print("控制已停止，ZMQ 代理已关闭，跟踪器已重置")
 
 
 # ==================== 主程序入口 ======================
@@ -599,26 +671,63 @@ def main():
 
             # 3. 坐标反求与控制计算
             detections = detector.postprocess(outputs, ratio, dwdh, orig_shape)
-            controller.update_detections(detections, orig_shape)
+            tracked, track_res = controller.update_detections(detections, orig_shape)
 
-            # 4. 界面渲染
-            frame = detector.draw_boxes(frame, detections)
-            cv2.putText(frame, f"NPU Pure FPS: {fps_pure:.1f}", (20, 30),
+            # ================================================================
+            # 4. "所见即所得" 界面渲染
+            #    控制与渲染的坐标绝对值统一：绘制追踪器的平滑框，不绘制原始 YOLO 框
+            #    ┌──────────┬──────────┬──────────┐
+            #    │ 状态     │ 框颜色   │ 标签     │
+            #    ├──────────┼──────────┼──────────┤
+            #    │ TRACK    │ 亮绿(0,255,0) │ ID:1 [MEAS] │
+            #    │ COAST    │ 黄(0,255,255) │ ID:1 [COAST]│
+            #    │ LOST     │ 不画框         │ 仅文字   │
+            #    └──────────┴──────────┴──────────┘
+            # ================================================================
+
+            # 追踪器锁定 → 绘制平滑框
+            if tracked and track_res.get("box") is not None:
+                bx1, by1, bx2, by2 = track_res["box"]
+                is_coast = track_res.get("is_predicted", False)
+                box_color = (0, 255, 255) if is_coast else (0, 255, 0)   # COAST=黄, MEAS=绿
+                label = f"ID:{track_res.get('primary_id','?')}"
+                label += " [COAST]" if is_coast else " [MEAS]"
+
+                cv2.rectangle(frame, (int(bx1), int(by1)), (int(bx2), int(by2)),
+                              box_color, 3)
+                cv2.putText(frame, label, (int(bx1), int(by1) - 12),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, box_color, 2)
+
+            # 左上角状态面板
+            cv2.putText(frame, f"NPU FPS: {fps_pure:.1f}", (20, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            if track_res:
+                status_str = ("✅" if tracked else "❌")
+                lost = track_res.get("lost_frames", 0)
+                n_act = track_res.get("n_active", 0)
+                cv2.putText(frame, f"Tracker: {status_str} ID:{track_res.get('primary_id','-')} "
+                            f"Lost:{lost}f Act:{n_act}",
+                            (20, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
 
             # 5. 推送至后台异步图传队列
             streamer.push_to_stream(frame)
 
-            # 6. 周期性打印 Router 状态（每 100 帧）
+            # 6. 周期性打印 Router + Tracker 状态（每 100 帧）
             if loop_count % 100 == 0:
                 state = controller.proxy.get_latest_state()
+                tracker_info = (f"  TK:{'✅' if tracked else '❌'}"
+                                f" ID:{track_res.get('primary_id','?')}"
+                                f" Lost:{track_res.get('lost_frames',0)}f"
+                                f" {'PRED' if track_res.get('is_predicted') else 'MEAS'}"
+                                f" Act:{track_res.get('n_active',0)}")
                 if state:
                     d = state["drone"]
                     age_us, _ = controller.proxy.get_state_freshness(state)
                     age_ms = (age_us or 0) / 1000
-                    print(f"📡 [Router] mode={d['mode']} armed={d['armed']} "
+                    print(f"📡 Router: mode={d['mode']} armed={d['armed']} "
                           f"alt={d['alt_rel']:.1f}m spd={d['ground_speed']:.1f}m/s "
-                          f"batt={d['battery']:.0f}% state_age={age_ms:.0f}ms",
+                          f"batt={d['battery']:.0f}% age={age_ms:.0f}ms"
+                          f"{tracker_info}",
                           end="" if loop_count % 500 != 0 else "\n")
 
     except KeyboardInterrupt:

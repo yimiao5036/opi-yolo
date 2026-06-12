@@ -56,3 +56,12 @@ class PID:
         self.last_err = 0.0
         self.integral = 0.0
         self.last_time = time.time()
+
+    def reset_integral(self):
+        """
+        仅清空积分项（I term），保留上一帧误差以维持微分（D term）连续性
+
+        用于卡尔曼 coast（滑行预测）期间：
+          只靠比例 (P) + 微分 (D) 稳住，积分项清零防止过冲。
+        """
+        self.integral = 0.0
