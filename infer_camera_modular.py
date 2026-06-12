@@ -9,7 +9,7 @@ import json
 import sys
 
 # ================== 昇腾 NPU SDK（保护性导入） =====================
-# 说明：本机可能无昇腾环境，try-except 确保 import 错误仅告警不崩溃。
+# 开发机可能无昇腾环境，try-except 确保 import 错误仅告警不崩溃。
 # 部署到香橙派 AI Pro 时只需安装 ais_bench 即可无缝运行。
 try:
     from ais_bench.infer.interface import InferSession
@@ -290,7 +290,7 @@ class UAVControlLoop:
         # ------------------------------------------------
 
         # 控制参数（按协议改为 20Hz，§4.1 要求 ≥20Hz）
-        self.control_hz = 20.0
+        self.control_hz = fc_cfg.get("control_hz", 20.0)
         self.control_interval = 1.0 / self.control_hz
 
         # 线程控制
@@ -355,7 +355,7 @@ class UAVControlLoop:
                 return False
 
         # ---- ④ 起飞到目标高度（如高度不足） ----
-        takeoff_alt = self.fc_cfg.get("takeoff_alt", 15.0)
+        takeoff_alt = self.fc_cfg.get("takeoff_alt", 5.0)
 
         if alt_rel < takeoff_alt * 0.9:
             print(f"🛫 高度 {alt_rel:.1f}m < 目标 {takeoff_alt:.1f}m，执行起飞...")

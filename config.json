@@ -13,6 +13,15 @@
         "udp_port": 9999
     },
     "flight_control": {
+        "req_endpoint": "tcp://127.0.0.1:5555",
+        "sub_endpoint": "tcp://127.0.0.1:5556",
+        "takeoff_alt": 5.0,
+        "control_hz": 20,
+        "target_tracker": {
+            "max_lost_frames": 8,
+            "max_asscociation_dist": 200.0,
+            "min_hits": 3
+        },
         "connection_string": "/dev/ttyAMA1",
         "baud_rate": 57600
     },
