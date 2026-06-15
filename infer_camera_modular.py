@@ -379,11 +379,11 @@ class UAVControlLoop:
                          mode, armed, alt_rel, age_s)
 
         # ---- ③ 解锁（如未解锁） ----
-        if not armed:
-            if self._do_arm():
-                armed = True
-            else:
-                return False
+        # if not armed:
+        #     if self._do_arm():
+        #         armed = True
+        #     else:
+        #         return False
 
         # ---- ④ 起飞到目标高度（如高度不足） ----
         takeoff_alt = self.fc_cfg.get("takeoff_alt", 5.0)
