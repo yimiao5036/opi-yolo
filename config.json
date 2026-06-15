@@ -26,7 +26,7 @@
         "baud_rate": 57600
     },
     "fc_info":{
-        "type": "ardupilot"
+        "type": "px4"
     },
     "pid_y": {
         "kp": 1.0,
