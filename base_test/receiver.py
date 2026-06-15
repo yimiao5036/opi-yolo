@@ -112,7 +112,8 @@ class JPEG2H264Streamer:
 
                 # 转换色彩空间 (BGR -> RGB) 并封装为 PyAV 帧
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                av_frame = av.VideoFrame.from_numpy_array(frame_rgb, format='rgb24')
+                # 修改后
+                av_frame = av.VideoFrame.from_ndarray(frame_rgb, format='rgb24')
 
                 # 分配高精度时钟戳
                 av_frame.pts = pts
