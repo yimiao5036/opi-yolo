@@ -383,7 +383,7 @@ class UAVControlLoop:
             if self._do_arm():
                 armed = True
             else:
-                return
+                return False
 
         # ---- ④ 起飞到目标高度（如高度不足） ----
         takeoff_alt = self.fc_cfg.get("takeoff_alt", 5.0)
@@ -478,7 +478,7 @@ class UAVControlLoop:
                 return True
             time.sleep(0.1)
         self.logger.error("解锁超时（30 次轮询未确认 armed=true）")
-        return
+        return False
 
     # ---- 主循环调用的接口 ----
 
