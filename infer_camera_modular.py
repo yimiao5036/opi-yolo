@@ -383,7 +383,7 @@ class UAVControlLoop:
             if self._do_arm():
                 armed = True
             else:
-                return False
+                return
 
         # ---- ④ 起飞到目标高度（如高度不足） ----
         takeoff_alt = self.fc_cfg.get("takeoff_alt", 5.0)
