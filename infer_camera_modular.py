@@ -730,8 +730,7 @@ def main():
 
     # 启动无人机连接（RouterProxy 启动 + 起飞序列）
     if not controller.start_uav():
-        main_logger.error("飞控启动失败，退出")
-        continue
+        main_logger.error("飞控启动失败")
 
     main_logger.info("NPU 精准推理 [ZMQ Router 协议版] 主循环启动...")
     loop_count = 0
