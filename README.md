@@ -315,7 +315,7 @@ opi-yolo/
 │   ├── check.py               # 视频帧率测试
 │   ├── fc_test.py             # 飞控通信测试
 │   ├── infer.py               # 图片推理测试
-│   └── receiver.py            # UDP 图传接收模拟
+│   └── receiver.py            # UDP 图传接收模拟以及简易的JPEG转换为H.264线程实现
 │
 ├── om/                        # 昇腾 OM 模型文件存放目录
 │   └── yolo26n-balloon2.om

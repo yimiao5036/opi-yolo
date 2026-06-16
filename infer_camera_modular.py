@@ -375,27 +375,6 @@ class UAVControlLoop:
         age_us, _ = self.proxy.get_state_freshness(state)
         age_s = (age_us or 0) / 1_000_000
 
-        if not mode or mode not in ['GUIDED', 'OFFBOARD']:
-            target_mode = 'GUIDED'  # ArduPilot
-            # 如果飞控是 PX4，则使用 'OFFBOARD'
-            if self.fc_cfg.get("fc_info", {}).get("type") == "px4":
-                target_mode = 'OFFBOARD'
-            self.logger.info("切换至 %s 模式...", target_mode)
-            ok, ack = self.proxy.send_command(target_mode)
-            if not ok:
-                self.logger.error("模式切换失败: %s", ack)
-                return False
-            # 等待模式切换生效（最多 2 秒）
-            for i in range(20):
-                state = self.proxy.get_latest_state()
-                if state and state["drone"]["mode"] == target_mode:
-                    self.logger.info("已进入 %s 模式", target_mode)
-                    break
-                time.sleep(0.1)
-            else:
-                self.logger.error("模式切换超时")
-                return False
-
         self.logger.info("初始状态: mode=%s armed=%s alt_rel=%.1fm state_age=%.2fs",
                          mode, armed, alt_rel, age_s)
 
