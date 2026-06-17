@@ -398,7 +398,7 @@ class UAVControlLoop:
                 alt = state["home"]["alt_msl"],
                 alt_frame="RELATIVE",
                 speed=3.0,action="TAKEOFF",
-                hover_time=5.0,yaw=NAN,
+                hover_time=5.0,yaw=state["drone"]["yaw"],
                 acceptance_radius=0.5,
                 is_last=False
             )
