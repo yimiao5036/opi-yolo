@@ -9,6 +9,8 @@ import json
 import sys
 import logging
 
+from mpmath.math2 import NAN
+
 # ================== 昇腾 NPU SDK（保护性导入） =====================
 # 开发机可能无昇腾环境，try-except 确保 import 错误仅告警不崩溃。
 # 部署到香橙派 AI Pro 时只需安装 ais_bench 即可无缝运行。
@@ -391,8 +393,14 @@ class UAVControlLoop:
         if alt_rel < takeoff_alt * 0.9:
             self.logger.info("高度 %.1fm < 目标 %.1fm，执行起飞...", alt_rel, takeoff_alt)
             ok, ack = self.proxy.send_waypoint(
-                action="TAKEOFF", alt=takeoff_alt,
-                alt_frame="RELATIVE", speed=3.0
+                lat = state["home"]["lat"],
+                lon = state["home"]["lon"],
+                alt = state["home"]["alt_msl"],
+                alt_frame="RELATIVE",
+                speed=3.0,action="TAKEOFF",
+                hover_time=5.0,yaw=NAN,
+                acceptance_radius=0.5,
+                is_last=False
             )
             if not ok:
                 self.logger.warning("TAKEOFF 指令 ACK 失败: %s，尝试通过 SETPOINT 爬升...", ack)
@@ -532,7 +540,7 @@ class UAVControlLoop:
             self.pid_z.reset_integral()
             with self.data_lock:
                 self._brake_requested = True
-                self.logger.info("目标丢失，请求刹车")
+                # self.logger.info("目标丢失，请求刹车")
 
         with self.data_lock:
             self.detections = detections
