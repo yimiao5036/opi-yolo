@@ -169,7 +169,6 @@ class RouterProxy:
         msg = {
             "type": "SETPOINT",
             "id": msg_id,
-            "seq":self._seq,
             "timestamp_us": int(time.time() * 1_000_000),
             "setpoint": {"control_mode": control_mode, **kwargs}
         }
@@ -223,6 +222,7 @@ class RouterProxy:
         msg = {
             "type": "WAYPOINT",
             "id": msg_id,
+            "seq": self._seq,
             "timestamp_us": int(time.time() * 1_000_000),
             "waypoint": wp_kwargs
         }
