@@ -85,6 +85,10 @@ class RouterProxy:
         self._seq = 0
         self._seq_lock = threading.Lock()
 
+        # ---- 消息ID （区分标识） ----
+        self.id = 0
+        self.id_lock = threading.Lock()
+
         # ---- 最新 STATE 缓存 ----
         self._latest_state = None
         self._state_lock = threading.Lock()
@@ -105,10 +109,18 @@ class RouterProxy:
     # ================================================================
 
     def _next_id(self) -> int:
+        """递增消息ID （区分标识）"""
+        with self.id_lock:
+            self.id += 1
+            return self.id
+
+    def _next_seq(self) -> int:
         """递增消息序号（线程安全）"""
         with self._seq_lock:
+            current_seq = self._seq
             self._seq += 1
-            return self._seq
+            return current_seq
+
 
     def _build_send_summary(self, msg: dict) -> str:
         """构建发送消息的内容概要，用于日志"""
@@ -219,10 +231,11 @@ class RouterProxy:
                                 alt=100.0, hover_time=3.0)
         """
         msg_id = self._next_id()
+        current_seq = self._next_seq()
         msg = {
             "type": "WAYPOINT",
             "id": msg_id,
-            "seq": self._seq,
+            "seq": current_seq,
             "timestamp_us": int(time.time() * 1_000_000),
             "waypoint": wp_kwargs
         }
