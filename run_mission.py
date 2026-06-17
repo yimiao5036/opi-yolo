@@ -71,7 +71,7 @@ class MissionOrchestrator:
       4. 提供标准视频源接口（可替换）
     """
 
-    def __init__(self, config_path="./config.json"):
+    def __init__(self,waypoints,config_path="./config.json"):
         self.logger = logging.getLogger("Orchestrator")
         self.logger.info("正在加载配置: %s", config_path)
 
@@ -84,11 +84,7 @@ class MissionOrchestrator:
         self.detector = YOLO26UAVInfer(cfg["model"])
 
         # ---- 航线定义（NED 坐标系，Z 向上为负） ----
-        self.waypoints = [
-            {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},
-            {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},
-            {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},
-        ]
+        self.waypoints = waypoints
 
         # ================================================================
         #  🚁 MissionManager（状态机 + 航点巡航）
@@ -417,7 +413,13 @@ def main():
     # 允许命令行指定配置文件路径
     config_file = sys.argv[1] if len(sys.argv) > 1 else "./config.json"
 
-    orchestrator = MissionOrchestrator(config_path=config_file)
+    waypoints = [
+            {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},
+            {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},
+            {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},
+        ]
+
+    orchestrator = MissionOrchestrator(config_path=config_file,waypoints=waypoints)
     orchestrator.start()
     orchestrator.run()
 
