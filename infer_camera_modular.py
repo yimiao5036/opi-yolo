@@ -395,7 +395,7 @@ class UAVControlLoop:
             ok, ack = self.proxy.send_waypoint(
                 lat = state["home"]["lat"],
                 lon = state["home"]["lon"],
-                alt = state["home"]["alt_msl"],
+                alt = takeoff_alt,
                 alt_frame="RELATIVE",
                 speed=3.0,action="TAKEOFF",
                 hover_time=5.0,yaw=state["drone"]["yaw"],
