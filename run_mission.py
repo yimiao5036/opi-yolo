@@ -41,7 +41,7 @@ import os
 import sys
 import threading
 import time
-
+import socket
 import cv2
 
 from drone_controller.mission_manager import (
@@ -121,6 +121,12 @@ class MissionOrchestrator:
         # ---- 主循环参数 ----
         self.running = False
         self.loop_interval = 0.05      # 20Hz
+        # ---- TCP 命令通道（急停 / 后续扩展） ----
+        self.tcp_port = cfg.get("command_channel", {}).get("tcp_port", 9999)
+        self.tcp_server_socket = None
+        self.tcp_server_running = False
+        self.tcp_server_thread = None
+        self.tcp_clients = []  # 保存已连接的客户端 socket（用于广播）
 
         self.logger.info("MissionOrchestrator 初始化完成")
 
@@ -218,6 +224,110 @@ class MissionOrchestrator:
             self.logger.error("航点处理异常: %s",e)
 
     # ================================================================
+    # 🖥️ TCP Server
+    # ================================================================
+    # run_mission.py — MissionOrchestrator 类中新增
+
+    def _start_tcp_command_server(self):
+        """启动 TCP 命令服务器（独立线程）"""
+        if self.tcp_server_thread and self.tcp_server_thread.is_alive():
+            return
+
+        self.tcp_server_running = True
+        self.tcp_server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.tcp_server_socket.bind(("0.0.0.0", self.tcp_port))
+        self.tcp_server_socket.listen(5)
+        self.tcp_server_socket.settimeout(1.0)  # 用于检查 self.tcp_server_running
+
+        self.tcp_server_thread = threading.Thread(
+            target=self._tcp_command_server_worker,
+            daemon=True,
+            name="tcp-command-server"
+        )
+        self.tcp_server_thread.start()
+        self.logger.info(f"🔌 TCP 命令通道已启动: port={self.tcp_port} (指令: STOP)")
+
+    def _tcp_command_server_worker(self):
+        """TCP 服务器主循环：接受客户端，分发处理"""
+        while self.tcp_server_running:
+            try:
+                client_sock, addr = self.tcp_server_socket.accept()
+                self.logger.info(f"📡 地面站已连接: {addr[0]}:{addr[1]}")
+                # 为每个客户端创建独立处理线程（支持多地面站同时连接）
+                client_thread = threading.Thread(
+                    target=self._handle_tcp_client,
+                    args=(client_sock, addr),
+                    daemon=True
+                )
+                client_thread.start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.tcp_server_running:
+                    self.logger.error(f"TCP Server 异常: {e}")
+                break
+
+        # 清理
+        if self.tcp_server_socket:
+            try:
+                self.tcp_server_socket.close()
+            except Exception:
+                pass
+            self.tcp_server_socket = None
+        self.logger.info("🔌 TCP 命令通道已关闭")
+
+    def _handle_tcp_client(self, client_sock, addr):
+        """处理单个 TCP 客户端连接（长连接）"""
+        client_sock.settimeout(1.0)  # 读超时，便于检测连接断开
+        try:
+            while self.tcp_server_running:
+                try:
+                    data = client_sock.recv(1024).decode().strip()
+                    if not data:
+                        # 客户端主动断开
+                        self.logger.info(f"📡 地面站断开: {addr[0]}:{addr[1]}")
+                        break
+
+                    msg = data.upper()
+                    self.logger.info(f"📨 收到指令: {msg} (来自 {addr[0]}:{addr[1]})")
+
+                    if msg == "STOP":
+                        self.logger.warning(f"🚨 触发紧急降落 (指令来自 {addr[0]}:{addr[1]})")
+                        self.mission.emergency_stop()
+                        self.running = False
+                        client_sock.send(b"ACK: EMERGENCY_STOP_TRIGGERED\n")
+                        # 触发后不立即断开，让客户端收到 ACK
+                        # 但主循环即将退出，服务器也会关闭
+
+                    elif msg == "PING":
+                        # 心跳 / 保活响应
+                        client_sock.send(b"PONG\n")
+
+                    elif msg == "STATUS":
+                        # 返回当前状态（便于调试）
+                        status = f"STATE:{self.mission.state.name}, WP:{self.mission.current_wp_index}/{len(self.mission.waypoints)}\n"
+                        client_sock.send(status.encode())
+
+                    else:
+                        client_sock.send(f"UNKNOWN_CMD: {msg}\n".encode())
+
+                except socket.timeout:
+                    # 读超时，继续循环检查 self.tcp_server_running
+                    continue
+                except BrokenPipeError:
+                    self.logger.warning(f"📡 地面站连接异常断开: {addr[0]}:{addr[1]}")
+                    break
+                except Exception as e:
+                    self.logger.error(f"TCP 客户端处理异常: {e}")
+                    break
+        finally:
+            try:
+                client_sock.close()
+            except Exception:
+                pass
+
+    # ================================================================
     #  🔌 启动
     # ================================================================
 
@@ -237,6 +347,9 @@ class MissionOrchestrator:
 
         # 3. 等待收到第一条 Router STATE
         self._wait_for_initial_state()
+
+        # ---- 启动 TCP 命令通道 ----
+        self._start_tcp_command_server()
 
         self.running = True
         self.logger.info("🚀 所有子系统就绪，主循环启动")
@@ -483,6 +596,18 @@ class MissionOrchestrator:
             self.logger.info("✔ VideoStreamer 已释放")
         except Exception as e:
             self.logger.warning("streamer release 异常: %s", e)
+
+        # ---- 停止 TCP 命令通道 ----
+        self.tcp_server_running = False
+        if self.tcp_server_socket:
+            try:
+                self.tcp_server_socket.close()
+            except Exception:
+                pass
+            self.tcp_server_socket = None
+        if self.tcp_server_thread and self.tcp_server_thread.is_alive():
+            self.tcp_server_thread.join(timeout=2.0)
+            self.logger.info("✔ TCP 命令通道已关闭")
 
         self.logger.info("🏁 所有资源已安全释放，程序退出")
 

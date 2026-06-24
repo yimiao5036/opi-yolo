@@ -733,7 +733,6 @@ class MissionManager:
                 "yaw": wp.get("yaw", 0),
             }
 
-    # mission_manager.py 中新增
 
     def set_waypoints(self, waypoints):
         """由外部调用，动态注入/更新航点列表"""
@@ -741,3 +740,37 @@ class MissionManager:
         self.current_wp_index = 0
         self._waypoints_ready = True  # 这个标志位结合 WAITING_WAYPOINTS 状态使用
         logger.info("MissionManager 航点已更新，共 %d 个", len(waypoints))
+
+
+    # ================================================================
+    #  🚨 紧急停靠（外部调用）
+    # ================================================================
+
+    def emergency_stop(self):
+        """
+        外部触发的紧急降落入口（可在任何状态下调用）
+
+        行为：
+          1. 发送 LAND 指令到飞控
+          2. 将状态机切换到 LANDING 状态
+          3. 记录警告日志（供事后分析）
+
+        注意：
+          - 此方法可在任何线程中调用（内部使用 proxy，proxy 本身是线程安全的）
+          - 调用后，主循环会检测到 state == LANDING 并执行降落逻辑
+          - 如果已经在 LANDING 状态，重复调用只会重新发送 LAND 指令
+        """
+        logger.warning("🚨 [emergency_stop] 紧急降落触发！")
+
+        # 1. 发送 LAND 指令（不管当前状态如何，直接发）
+        ok, ack = self.proxy.send_command("LAND")
+        if ok:
+            logger.info("✅ LAND 指令已发送")
+        else:
+            logger.error(f"❌ LAND 指令发送失败: {ack}")
+
+        # 2. 状态机强制切换到 LANDING（让主循环接管后续降落逻辑）
+        self.state = MissionState.LANDING
+
+        # 3. 重置一些计时器，让降落逻辑从当前状态开始
+        self._state_start_time = time.time()
