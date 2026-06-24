@@ -161,7 +161,7 @@ class RouterProxy:
         注册 QGC_WAYPOINT 回调 （在 SUB 线程调用，不应阻塞）
         callback 签名：callback(waypoint_data: dict)
         """
-        self._waypoint_callback = callback
+        self._waypoints_callback = callback
 
     # ================================================================
     #  发送接口（线程安全）
