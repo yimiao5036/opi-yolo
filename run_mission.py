@@ -172,6 +172,7 @@ class MissionOrchestrator:
                 hold_time = wp.get("param1", 8.0)   # 悬停时间（如有）
 
                 x, y, z = latlon_to_ned(lat, lon, alt, ref_lat, ref_lon, ref_alt)
+                print(f"航点信息；{x}{y}{z}")
 
                 # 根据 MAV_CMD 类型构建内部航点
                 if cmd == 22:  # TAKEOFF
@@ -507,13 +508,13 @@ def main():
     # 允许命令行指定配置文件路径
     config_file = sys.argv[1] if len(sys.argv) > 1 else "./config.json"
 
-    waypoints = [
-            {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},
-            {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},
-            {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},
-        ]
+    # waypoints = [
+    #         {'x': 1.0, 'y': 0.0, 'z': -1.5, 'yaw': 0},
+    #         {'x': 1.0, 'y': 1.0, 'z': -1.5, 'yaw': 90},
+    #         {'x': 0.0, 'y': 0.0, 'z': -1.2, 'yaw': 0},
+    #     ]
 
-    orchestrator = MissionOrchestrator(config_path=config_file,waypoints=waypoints)
+    orchestrator = MissionOrchestrator(config_path=config_file,waypoints=None)
     orchestrator.start()
     orchestrator.run()
 
