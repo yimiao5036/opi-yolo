@@ -103,6 +103,7 @@ class RouterProxy:
         # ---- 外部回调钩子 ----
         self._state_callback = None
         self._alert_callback = None
+        self._waypoints_callback = None
 
     # ================================================================
     #  内部工具
@@ -154,6 +155,13 @@ class RouterProxy:
         self.req.setsockopt(zmq.REQ_CORRELATE, 1)
         self.req.connect(self.req_endpoint)
         logger.warning("REQ socket 已重建")
+
+    def set_waypoints_callback(self, callback):
+        """
+        注册 QGC_WAYPOINT 回调 （在 SUB 线程调用，不应阻塞）
+        callback 签名：callback(waypoint_data: dict)
+        """
+        self._waypoint_callback = callback
 
     # ================================================================
     #  发送接口（线程安全）
@@ -431,6 +439,14 @@ class RouterProxy:
                 elif msg_type == "PX4_ACK":
                     logger.info("PX4_ACK: cmd=%s result=%s",
                                 data.get("ref_cmd"), data.get("result"))
+
+                elif msg_type == "QGC_WAYPOINTS":
+                    logger.info("📥 收到 QGC_WAYPOINTS: count=%d", data.get("count", 0))
+                    if self._waypoints_callback:
+                        try:
+                            self._waypoints_callback(data)
+                        except Exception as e:
+                            logger.error("QGC_WAYPOINTS 回调异常: %s", e)
 
                 elif msg_type == "QUERY_REPLY":
                     # QUERY_REPLY 由 send_query 的同步 recv 处理，

@@ -35,27 +35,27 @@ run_mission.py — 基于 ZMQ Router 协议的主任务入口
     即可，保持 read_frame() → (ret, frame) 的协议不变。
 """
 
-import os
-import sys
-import time
 import json
 import logging
+import os
+import sys
 import threading
+import time
 
 import cv2
 
-# ---- ZMQ Router 代理与状态机 ----
-from drone_controller.router_proxy import RouterProxy
 from drone_controller.mission_manager import (
     MissionManager,
     MissionState,
     FailsafeTriggered,
 )
-
+# ---- ZMQ Router 代理与状态机 ----
+from drone_controller.router_proxy import RouterProxy
 # ---- 视觉闭环控制（复用 infer_camera_modular 现有实现） ----
 # 注意：此处不修改 UAVControlLoop 任何内部逻辑。
 # run_mission.py 在外部协调其控制线程的启停。
 from infer_camera_modular import UAVControlLoop, VideoStreaming, YOLO26UAVInfer
+from utils.coord import latlon_to_ned
 
 logger = logging.getLogger("RunMission")
 
@@ -97,6 +97,8 @@ class MissionOrchestrator:
             sub_endpoint=fc.get("sub_endpoint", "tcp://127.0.0.1:5556"),
         )
 
+        self.mission_proxy.set_waypoints_callback(self._on_qgc_waypoints)
+
         self.mission = MissionManager(
             proxy=self.mission_proxy,
             waypoints=self.waypoints,
@@ -121,6 +123,98 @@ class MissionOrchestrator:
         self.loop_interval = 0.05      # 20Hz
 
         self.logger.info("MissionOrchestrator 初始化完成")
+
+    # ================================================================
+    # 📥 QGC 航点回调（由 RouterProxy 的 SUB 线程触发）
+    # ================================================================
+
+    def _on_qgc_waypoints(self,data: dict):
+        """
+        收到 QGC 下发的航点列表 -> 转换坐标系 -> 注入 MissionManager
+        """
+        try:
+            raw_wps = data.get("waypoints", [])
+            if not raw_wps:
+                self.logger.warning("QGC 航点列表为空，请检查是否提交或路由问题")
+                return
+
+            self.logger.info("📥 收到 %d 个航点，开始坐标转换...", len(raw_wps))
+
+            # ---- ① 获取参考点（起飞点） ----
+            state = self.mission_proxy.get_latest_state()
+            if state is None:
+                self.logger.error("无法获取 STATE，缺少参考经纬度，航点转换失败")
+                return
+
+            home = state.get("home", {})
+            ref_lat = home.get("lat", 0.0)
+            ref_lon = home.get("lon", 0.0)
+            ref_alt = home.get("alt", 0.0)
+
+            # ---- 容错：如果 HOME 未初始化，用第一个航点作为参考（纯相对飞行） ----
+            if ref_lat == 0.0 and ref_lon == 0.0:
+                self.logger.warning("STATE.home 未初始化，使用第一个航点作为参考原点")
+                ref_lat = raw_wps[0].get("lat", 0.0)
+                ref_lon = raw_wps[0].get("lon", 0.0)
+                ref_alt = raw_wps[0].get("z", 0.0)
+
+            self.logger.info("参考原点 (起飞点): lat=%.6f, lon=%.6f, alt=%.1fm",
+                             ref_lat, ref_lon, ref_alt)
+
+            # ---- ② 逐点转换 ----
+            converted = []
+            for idx, wp in enumerate(raw_wps):
+                lat = wp.get("lat", 0.0)
+                lon = wp.get("lon", 0.0)
+                alt = wp.get("z", 0.0)          # QGC 中 z 为海拔
+                cmd = wp.get("command", 16)     # 16=WAYPOINT, 22=TAKEOFF, 21=LAND
+                yaw = wp.get("param4", 0.0)     # param4 通常存偏航角
+                hold_time = wp.get("param1", 8.0)   # 悬停时间（如有）
+
+                x, y, z = latlon_to_ned(lat, lon, alt, ref_lat, ref_lon, ref_alt)
+
+                # 根据 MAV_CMD 类型构建内部航点
+                if cmd == 22:  # TAKEOFF
+                    # 起飞点强制归零水平位置，高度取绝对海拔差
+                    converted.append({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "z": z,  # 已按 NED 转换（向上为负）
+                        "yaw": yaw,
+                        "command": "TAKEOFF",
+                        "hold_duration": hold_time,
+                    })
+                    self.logger.info("航点 %d [TAKEOFF]: 高度 %.1fm", idx, -z)
+
+                elif cmd == 21:  # LAND
+                    converted.append({
+                        "x": x,
+                        "y": y,
+                        "z": 0.0,  # 着陆点 z=0（地面）
+                        "yaw": yaw,
+                        "command": "LAND",
+                    })
+                    self.logger.info("航点 %d [LAND]: NED(%.1f, %.1f)", idx, x, y)
+
+                else:  # 普通航点 (command=16 或未识别)
+                    converted.append({
+                        "x": x,
+                        "y": y,
+                        "z": z,  # NED 高度
+                        "yaw": yaw,
+                        "command": "WAYPOINT",
+                        "hold_duration": hold_time,
+                    })
+                    self.logger.debug("航点 %d [WAYPOINT]: NED(%.1f, %.1f, %.1f)",
+                                      idx, x, y, z)
+
+            self.mission.set_waypoints(converted)
+
+            # 如果当前处于等待航点状态，状态机会在下一帧自动响应
+            self.logger.info("✅ 航点转换完成，共 %d 个航点已加载", len(converted))
+
+        except Exception as e:
+            self.logger.error("航点处理异常: %s",e)
 
     # ================================================================
     #  🔌 启动

@@ -163,7 +163,7 @@ class MissionManager:
         # UAVControlLoop 或 run_mission.py 在判定视觉追踪完成时置 True
         self.tracking_completed = False
         # 追踪最大时长兜底
-        self.tracking_max_duration = 30.0
+        self.tracking_max_duration = 10.0
 
         logger.info("MissionManager 初始化: %d 个航点, 目标高度=%.1fm, "
                      "到达半径=%.1fm, 搜寻时长=%.1fs, 返航=%s",
@@ -712,3 +712,12 @@ class MissionManager:
                 "z": wp.get("z", self.target_altitude),
                 "yaw": wp.get("yaw", 0),
             }
+
+    # mission_manager.py 中新增
+
+    def set_waypoints(self, waypoints):
+        """由外部调用，动态注入/更新航点列表"""
+        self.waypoints = list(waypoints)
+        self.current_wp_index = 0
+        self._waypoints_ready = True  # 这个标志位结合 WAITING_WAYPOINTS 状态使用
+        logger.info("MissionManager 航点已更新，共 %d 个", len(waypoints))
