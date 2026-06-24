@@ -398,6 +398,7 @@ class RouterProxy:
                 msg_str = self.sub.recv_string()
                 data = json.loads(msg_str)
                 msg_type = data.get("type")
+                logger.info(f"📨 SUB 收到消息类型: {msg_type}")
 
                 if msg_type == "STATE":
                     with self._state_lock:
