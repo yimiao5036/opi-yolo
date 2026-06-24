@@ -349,7 +349,9 @@ class MissionOrchestrator:
         self._wait_for_initial_state()
 
         # ---- 启动 TCP 命令通道 ----
-        self._start_tcp_command_server()
+        cmd_cfg = self.cfg.get("command_channel", {})
+        if cmd_cfg.get("enabled", True):
+            self._start_tcp_command_server()
 
         self.running = True
         self.logger.info("🚀 所有子系统就绪，主循环启动")
