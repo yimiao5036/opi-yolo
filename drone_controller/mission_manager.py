@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 
 class MissionState(Enum):
     """无人机任务状态枚举"""
+    WAITING_WAYPOINTS=-1  # 等待地面站下发航点
     INIT = 0              # 初始化 / 等待连接
     ARMING = 1            # 解锁中
     TAKEOFF = 2           # 自动起飞中
@@ -124,6 +125,17 @@ class MissionManager:
         # ---- 任务参数 ----
         # 航点列表（外部队列已经使用 NED 坐标系，Z 负值向上）
         self.waypoints = list(waypoints) if waypoints else []
+        #  根据是否有航点决定初始状态
+        if self.waypoints:
+            # 有预置航点（如测试用硬编码），直接进入初始化
+            self.state = MissionState.INIT
+            self._waypoints_ready = True
+            logger.info("MissionManager 初始化完成，已有 %d 个航点", len(self.waypoints))
+        else:
+            # 无航点，进入等待状态（等待 QGC 下发）
+            self.state = MissionState.WAITING_WAYPOINTS
+            self._waypoints_ready = False
+            logger.info("MissionManager 初始化完成，等待 QGC 下发航点...")
         self.target_altitude = -abs(target_altitude)   # NED Z（负值向上）
         self.arrival_radius = arrival_radius
         self.hold_duration = hold_duration
@@ -134,7 +146,6 @@ class MissionManager:
         )
 
         # ---- 状态机 ----
-        self.state = MissionState.INIT
         self.current_wp_index = 0
 
         # ---- 当前目标航点（共享给外部主循环 / UAVControlLoop） ----
@@ -201,6 +212,15 @@ class MissionManager:
                     return
             else:
                 logger.warning("⚠️ 尚未收到 STATE，跳过本轮处理")
+                return
+
+        # ---- 特殊状态，等待航点 ----
+        if self.state == MissionState.WAITING_WAYPOINTS:
+            if self._waypoints_ready:
+                logger.info("✅ 航点已就绪，转入 INIT 状态")
+                self.state = MissionState.INIT
+                self._state_start_time = time.time()
+            else:
                 return
 
         # ---- Failsafe 越权检查 ----
