@@ -28,6 +28,10 @@
     "fc_info":{
         "type": "px4"
     },
+    "command_channel": {
+        "enabled": true,
+        "tcp_port": 9999
+    },
     "pid_y": {
         "kp": 1.0,
         "ki": 0.02,
