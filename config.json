@@ -32,6 +32,11 @@
         "enabled": true,
         "tcp_port": 9999
     },
+    "log": {
+    "enable_flight_log": true,
+    "flight_log_interval": 20,
+    "log_dir": "./log"
+    },
     "pid_y": {
         "kp": 1.0,
         "ki": 0.02,
