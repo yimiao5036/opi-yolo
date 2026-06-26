@@ -287,18 +287,24 @@ class UAVControlLoop:
       - 无目标时 PID 自动复位 → 输出零速
     """
 
-    def __init__(self, fc_cfg, pid_y_cfg, pid_z_cfg):
+    def __init__(self, fc_cfg, pid_y_cfg, pid_z_cfg, proxy=None):
         self.logger = logging.getLogger("UAVControlLoop")
 
         # ---- 保存 config（供 start_uav 使用如 takeoff_alt 等） ----
         self.fc_cfg = fc_cfg
         # -----------------------------------------------------------
 
-        # ---- 使用 RouterProxy 替换 DroneController ----
-        self.proxy = RouterProxy(
-            req_endpoint=fc_cfg.get("req_endpoint", "tcp://127.0.0.1:5555"),
-            sub_endpoint=fc_cfg.get("sub_endpoint", "tcp://127.0.0.1:5556")
-        )
+        # ---- 使用 RouterProxy（支持外部注入共享实例） ----
+        if proxy is not None:
+            self.proxy = proxy
+            self._owns_proxy = False
+            self.logger.info("使用外部注入的共享 RouterProxy")
+        else:
+            self.proxy = RouterProxy(
+                req_endpoint=fc_cfg.get("req_endpoint", "tcp://127.0.0.1:5555"),
+                sub_endpoint=fc_cfg.get("sub_endpoint", "tcp://127.0.0.1:5556")
+            )
+            self._owns_proxy = True
         # ---------------------------------------------
 
         self.pid_y = PID(**pid_y_cfg)
@@ -679,8 +685,12 @@ class UAVControlLoop:
         self.tracker.reset()
         self._tracked_result = None
 
-        self.proxy.close()
-        self.logger.info("控制已停止，ZMQ 代理已关闭，跟踪器已重置")
+        if self._owns_proxy:
+            self.proxy.close()
+            self.logger.info("自有 RouterProxy 已关闭")
+        else:
+            self.logger.info("共享 RouterProxy 交由外部管理，跳过 close")
+        self.logger.info("控制已停止，跟踪器已重置")
 
 
 # ==================== 主程序入口 ======================

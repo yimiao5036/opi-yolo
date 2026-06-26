@@ -5,19 +5,21 @@ run_mission.py — 基于 ZMQ Router 协议的主任务入口
   本脚本是整个无人机任务系统的总装粘合剂。采用领域驱动模块化设计，
   将各子系统按职责独立实例化，在主循环中进行控制权协调。
 
-    ┌─ MissionManager ────────────┐
-    │  RouterProxy (own)          │  状态机管理 + 航点巡航
-    │  POSITION SETPOINT (非追踪) │  控制权：NAVIGATING/HOLD_TASK/...
-    └─────────────────────────────┘
-              ↕ 控制权协调
-    ┌─ UAVControlLoop ────────────┐
-    │  RouterProxy (own)          │  20Hz VELOCITY 闭环追踪
-    │  TargetTracker + PID        │  控制权：仅 VISUAL_TRACKING
-    └─────────────────────────────┘
-    ┌─ 感知模块 ───────────────────┐
-    │  VideoStreaming             │  摄像头/RTSP 采集
-    │  YOLO26UAVInfer             │  昇腾 NPU 推理
-    └─────────────────────────────┘
+    ┌─ MissionOrchestrator ──────────┐
+    │  RouterProxy (shared)          │  单一共享 ZMQ 代理
+    └──────────┬─────────────────────┘
+               │ 注入
+         ┌─────┴──────┐
+         ▼              ▼
+    ┌─ MissionManager   ┌─ UAVControlLoop ──┐
+    │  状态机 + 航点巡航  │  20Hz VELOCITY    │
+    │  POSITION SETPOINT │  闭环追踪          │
+    │  (非追踪期间)      │  (VISUAL_TRACKING) │
+    └───────────────────┴────────────────────┘
+    ┌─ 感知模块 ─────────┐
+    │  VideoStreaming   │  摄像头/RTSP 采集
+    │  YOLO26UAVInfer   │  昇腾 NPU 推理
+    └───────────────────┘
 
 【控制权协调规则】
   同一时刻只有一个人持有「SETPOINT 发令权」：
@@ -27,7 +29,8 @@ run_mission.py — 基于 ZMQ Router 协议的主任务入口
 
 【安全设计】
     - try / except FailsafeTriggered / finally 全面资源释放
-    - 两个独立 RouterProxy，避免 REQ socket 线程竞争
+    - MissionManager 和 UAVControlLoop 共享同一 RouterProxy，
+      通过控制权协调避免 REQ socket 并发冲突
     - 控制线程启停由状态机状态变化驱动，逻辑可预测
 
 【可扩展的图像输入接口】
@@ -107,18 +110,17 @@ class MissionOrchestrator:
         # ================================================================
         #  🚁 MissionManager（状态机 + 航点巡航）
         # ================================================================
-        # 拥有独立的 RouterProxy，用于读取 STATE 和发送 COMMAND /
-        # WAYPOINT / POSITION SETPOINT。
+        # 与 UAVControlLoop 共享同一个 RouterProxy（见下方）。
         fc = cfg["flight_control"]
-        self.mission_proxy = RouterProxy(
+        self.proxy = RouterProxy(
             req_endpoint=fc.get("req_endpoint", "tcp://127.0.0.1:5555"),
             sub_endpoint=fc.get("sub_endpoint", "tcp://127.0.0.1:5556"),
         )
 
-        self.mission_proxy.set_waypoints_callback(self._on_qgc_waypoints)
+        self.proxy.set_waypoints_callback(self._on_qgc_waypoints)
 
         self.mission = MissionManager(
-            proxy=self.mission_proxy,
+            proxy=self.proxy,
             waypoints=self.waypoints,
             target_altitude=1.5,
             arrival_radius=0.3,
@@ -129,10 +131,11 @@ class MissionOrchestrator:
         # ================================================================
         #  🛸 UAVControlLoop（20Hz VELOCITY 闭环追踪）
         # ================================================================
-        # 拥有独立的 RouterProxy。其 20Hz 控制线程仅在 VISUAL_TRACKING
-        # 期间运行，其余时间处于停止状态，避免与 MissionManager 冲突。
+        # 注入与 MissionManager 相同的 RouterProxy 实例，避免两个独立
+        # SUB 线程和 REQ socket 竞争同一 Router。
         self.controller = UAVControlLoop(
             cfg["flight_control"], cfg["pid_y"], cfg["pid_z"],
+            proxy=self.proxy,
         )
         self._control_active = False   # 控制线程运行标志
 
@@ -247,7 +250,7 @@ class MissionOrchestrator:
     def _collect_and_enqueue_log(self):
         """采集当前飞行状态，推入日志队列（主线程执行，极轻量）"""
         try:
-            state = self.mission_proxy.get_latest_state()
+            state = self.proxy.get_latest_state()
             if state is None:
                 return
 
@@ -269,7 +272,7 @@ class MissionOrchestrator:
                 drone.get("battery", 0.0),  # battery_percent
                 current_state,  # state (string)
                 wp_idx,  # wp_index
-                len(self._latest_detections) if hasattr(self, 'detections') else 0,  # detect_count
+                len(self._latest_detections) if self._latest_detections is not None else 0,  # detect_count
                 tracking_active  # tracking_active
             )
 
@@ -300,7 +303,7 @@ class MissionOrchestrator:
             self.logger.info("📥 收到 %d 个航点，开始坐标转换...", len(raw_wps))
 
             # ---- ① 获取参考点（起飞点） ----
-            state = self.mission_proxy.get_latest_state()
+            state = self.proxy.get_latest_state()
             if state is None:
                 self.logger.error("无法获取 STATE，缺少参考经纬度，航点转换失败")
                 return
@@ -488,15 +491,9 @@ class MissionOrchestrator:
         """启动所有子系统"""
         self.logger.info("正在启动所有子系统...")
 
-        # 1. 启动 MissionManager 的 ZMQ 代理（SUB 监听 + REQ 就绪）
-        self.mission_proxy.start()
-        self.logger.info("✔ MissionManager Proxy 已启动")
-
-        # 2. 启动 UAVControlLoop 的 ZMQ 代理
-        #    start_uav() 会执行完整的起飞序列，我们不需要 ——
-        #    MissionManager 负责起飞。这里只启动 SUB 线程收 STATE。
-        self.controller.proxy.start()
-        self.logger.info("✔ UAVControlLoop Proxy 已启动")
+        # 1. 启动共享 ZMQ 代理（MissionManager 与 UAVControlLoop 共用）
+        self.proxy.start()
+        self.logger.info("✔ 共享 RouterProxy 已启动（MissionManager + UAVControlLoop 共用）")
 
         # 3. 等待收到第一条 Router STATE
         self._wait_for_initial_state()
@@ -516,7 +513,7 @@ class MissionOrchestrator:
         """等待 Router 推送第一条 STATE"""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            state = self.mission_proxy.get_latest_state()
+            state = self.proxy.get_latest_state()
             if state is not None:
                 drone = state.get("drone", {})
                 self.logger.info(
@@ -642,7 +639,7 @@ class MissionOrchestrator:
         self.logger.info("▶ [控制权] 启动 UAVControlLoop VELOCITY 线程")
 
         # 记录进入追踪时的飞机状态
-        state = self.mission_proxy.get_latest_state()
+        state = self.proxy.get_latest_state()
         if state:
             d = state.get("drone", {})
             self.logger.info("追踪初始状态: mode=%s alt=%.1fm armed=%s",
@@ -694,7 +691,7 @@ class MissionOrchestrator:
 
         # ---- 状态面板 ----
         state_name = self.mission.state.name
-        wp_text = f"WP: {self.mission.current_wp_index + 1}/{len(self.waypoints)}"
+        wp_text = f"WP: {self.mission.current_wp_index + 1}/{len(self.mission.waypoints)}"
         ctrl_text = "CTRL:VELOCITY" if self._control_active else "CTRL:POSITION"
 
         cv2.putText(frame, f"State: {state_name} | {wp_text}",
@@ -706,7 +703,7 @@ class MissionOrchestrator:
 
         # ---- 每 100 帧打印详细状态日志 ----
         if loop_count % 100 == 0:
-            state = self.mission_proxy.get_latest_state()
+            state = self.proxy.get_latest_state()
             if state:
                 d = state.get("drone", {})
                 self.logger.info(
@@ -754,21 +751,16 @@ class MissionOrchestrator:
                 self._log_thread.join(timeout=2.0)
                 self.logger.info("✔ 飞行日志线程已停止")
 
-        # 2. 关闭 MissionManager 的 Proxy
+        # 2. 关闭共享 ZMQ 代理（MissionManager + UAVControlLoop 共用）
+        #    注意：UAVControlLoop 不拥有 proxy 生命周期（_owns_proxy=False），
+        #    仅在此处统一关闭一次。
         try:
-            self.mission_proxy.close()
-            self.logger.info("✔ MissionManager Proxy 已关闭")
+            self.proxy.close()
+            self.logger.info("✔ 共享 RouterProxy 已关闭")
         except Exception as e:
-            self.logger.warning("mission_proxy close 异常: %s", e)
+            self.logger.warning("proxy close 异常: %s", e)
 
-        # 3. 关闭 UAVControlLoop 的 Proxy（直接访问其内部 proxy）
-        try:
-            self.controller.proxy.close()
-            self.logger.info("✔ UAVControlLoop Proxy 已关闭")
-        except Exception as e:
-            self.logger.warning("control_proxy close 异常: %s", e)
-
-        # 4. 释放视频资源
+        # 3. 释放视频资源
         try:
             self.streamer.release()
             self.logger.info("✔ VideoStreamer 已释放")
