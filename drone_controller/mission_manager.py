@@ -388,8 +388,14 @@ class MissionManager:
             logger.info("\n[解锁成功] 发送起飞指令 (alt=%.1fm)", takeoff_alt)
 
             ok, ack = self.proxy.send_waypoint(
-                action="TAKEOFF", alt=takeoff_alt,
-                alt_frame="RELATIVE", speed=2.0,
+                lat=state["home"]["lat"],
+                lon=state["home"]["lon"],
+                alt=takeoff_alt,
+                alt_frame="RELATIVE",
+                speed=3.0, action="TAKEOFF",
+                hover_time=5.0, yaw=state["drone"]["yaw"],
+                acceptance_radius=0.5,
+                is_last=True
             )
             if ok:
                 self.state = MissionState.TAKEOFF
