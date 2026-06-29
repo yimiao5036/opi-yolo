@@ -393,7 +393,7 @@ class MissionManager:
                 alt=takeoff_alt,
                 alt_frame="RELATIVE",
                 speed=3.0, action="TAKEOFF",
-                hover_time=5.0, yaw=state["drone"]["yaw"],
+                yaw=state["drone"]["yaw"],
                 acceptance_radius=0.5,
                 is_last=True
             )
@@ -505,6 +505,30 @@ class MissionManager:
             return
 
         wp = self.waypoints[self.current_wp_index]
+        cmd = wp.get("command", "WAYPOINT")
+
+        # 特殊航点分支选择
+        # 起飞航点
+        if cmd == "TAKEOFF":
+            # 飞到原点 + 目标高度
+            self.proxy.send_setpoint(
+                x=0, y=0, z=wp.get("z", self.target_altitude),
+                yaw=wp.get("yaw", 0.0),control_mode="POSITION",
+            )
+            current_z = self._get_current_z(state)
+            target_z = wp.get("z", self.target_altitude)
+            if abs(current_z - target_z) < 0.5:
+                self.current_wp_index += 1
+            return
+
+        # 降落航点
+        if cmd == "LAND":
+            logger.info("🛬 执行降落")
+            self.proxy.send_command("LAND")
+            self.state = MissionState.LANDING
+            return
+
+
         wp_x = wp["x"]
         wp_y = wp["y"]
         wp_z = wp.get("z", self.target_altitude)
