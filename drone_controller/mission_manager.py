@@ -332,9 +332,14 @@ class MissionManager:
             armed = drone.get("armed", False)
             mode = drone.get("mode", "")
             alt_rel = drone.get("alt_rel", 0.0)
+            home = state.get("home", {})
 
             logger.info("[INIT] mode=%s armed=%s alt_rel=%.1fm",
                         mode, armed, alt_rel)
+
+            if not home.get("valid", False):
+                logger.warning("[ARMING] home.valid=false，等待起飞点有效...")
+                return
 
             # A) 已在 OFFBOARD + 已解锁 → 直接巡航
             if armed and mode == "OFFBOARD":
@@ -372,6 +377,7 @@ class MissionManager:
         """
         try:
             armed = state["drone"].get("armed", False)
+            home = state.get("home", {})
 
             if not armed:
                 elapsed = time.time() - self._state_start_time
@@ -381,6 +387,10 @@ class MissionManager:
                     self._state_start_time = time.time()
                 else:
                     logger.info("[ARMING] 等待解锁... (%.1fs)", elapsed)
+                return
+
+            if not home.get("valid", False):
+                logger.warning("[ARMING] home.valid=false，等待起飞点有效...")
                 return
 
             # ---- 解锁成功 → 起飞 ----
