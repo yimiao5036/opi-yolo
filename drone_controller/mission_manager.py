@@ -379,6 +379,7 @@ class MissionManager:
         """
         [ARMING] 等待解锁确认，成功后进入 TAKEOFF
         """
+        global need_homeLog
         try:
             armed = state["drone"].get("armed", False)
             home = state.get("home", {})
