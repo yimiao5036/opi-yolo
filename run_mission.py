@@ -122,7 +122,7 @@ class MissionOrchestrator:
         self.mission = MissionManager(
             proxy=self.proxy,
             waypoints=self.waypoints,
-            target_altitude=1.5,
+            target_altitude=3.0,
             arrival_radius=0.3,
             hold_duration=8.0,
             return_to_home=False,
