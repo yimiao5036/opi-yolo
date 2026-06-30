@@ -382,6 +382,7 @@ class MissionManager:
         try:
             armed = state["drone"].get("armed", False)
             home = state.get("home", {})
+            need_homeLog = True
 
             if not armed:
                 elapsed = time.time() - self._state_start_time
