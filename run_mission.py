@@ -791,12 +791,16 @@ def main():
     # 创建日志目录
     os.makedirs("./log", exist_ok=True)
 
+    # 生成带时间戳的日志文件名（精确到秒）
+    log_timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_file_path = f"./log/mission_run_{log_timestamp}.log"
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.StreamHandler(),
-            logging.FileHandler("./log/mission_run.log", mode="w"),
+            logging.StreamHandler(),                     # 终端输出（保留）
+            logging.FileHandler(log_file_path, mode="w"), # 每次新建，覆盖写入
         ],
     )
 
