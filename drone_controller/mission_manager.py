@@ -329,13 +329,13 @@ class MissionManager:
           B) 未解锁 → 发 ARM 指令
           C) 已解锁但非 OFFBOARD → 进入 ARMING 等待后续 TAKEOFF 序列
         """
+        global need_homeLog
         try:
             drone = state["drone"]
             armed = drone.get("armed", False)
             mode = drone.get("mode", "")
             alt_rel = drone.get("alt_rel", 0.0)
             home = state.get("home", {})
-            need_homeLog = True
 
             logger.info("[INIT] mode=%s armed=%s alt_rel=%.1fm",
                         mode, armed, alt_rel)
@@ -382,7 +382,6 @@ class MissionManager:
         try:
             armed = state["drone"].get("armed", False)
             home = state.get("home", {})
-            need_homeLog = True
 
             if not armed:
                 elapsed = time.time() - self._state_start_time
