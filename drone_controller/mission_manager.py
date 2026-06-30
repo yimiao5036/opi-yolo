@@ -30,6 +30,8 @@ import math
 import logging
 from enum import Enum
 
+from sympy import true
+
 logger = logging.getLogger(__name__)
 
 
@@ -333,12 +335,14 @@ class MissionManager:
             mode = drone.get("mode", "")
             alt_rel = drone.get("alt_rel", 0.0)
             home = state.get("home", {})
+            need_homeLog = True
 
             logger.info("[INIT] mode=%s armed=%s alt_rel=%.1fm",
                         mode, armed, alt_rel)
 
-            if not home.get("valid", False):
+            if not home.get("valid", False) and need_homeLog:
                 logger.warning("[INIT] home.valid=false，等待起飞点有效...")
+                need_homeLog = False
                 return
 
             # A) 已在 OFFBOARD + 已解锁 → 直接巡航
@@ -378,6 +382,7 @@ class MissionManager:
         try:
             armed = state["drone"].get("armed", False)
             home = state.get("home", {})
+            need_homeLog = True
 
             if not armed:
                 elapsed = time.time() - self._state_start_time
@@ -389,8 +394,9 @@ class MissionManager:
                     logger.info("[ARMING] 等待解锁... (%.1fs)", elapsed)
                 return
 
-            if not home.get("valid", False):
+            if not home.get("valid", False) and need_homeLog:
                 logger.warning("[ARMING] home.valid=false，等待起飞点有效...")
+                need_homeLog = False
                 return
 
             # ---- 解锁成功 → 起飞 ----
