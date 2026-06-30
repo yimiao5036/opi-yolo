@@ -97,7 +97,8 @@ class VideoStreaming:
         """ 打开摄像头或 RTSP 流，并设置低延迟参数 """
         try:
             self.logger.info("正在连接视频源: %s", self.video_source)
-            self.cap = cv2.VideoCapture(self.video_source)
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+            self.cap = cv2.VideoCapture(self.video_source, cv2.CAP_FFMPEG)
 
             if self.is_rtsp:
                 # 设置 RTSP 缓冲区大小（只保留 1 帧，降低延迟）
