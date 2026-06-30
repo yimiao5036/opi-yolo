@@ -796,7 +796,7 @@ def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler("./log/mission_run.log", mode="a"),
+            logging.FileHandler("./log/mission_run.log", mode="w"),
         ],
     )
 
