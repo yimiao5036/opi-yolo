@@ -338,7 +338,7 @@ class MissionManager:
                         mode, armed, alt_rel)
 
             if not home.get("valid", False):
-                logger.warning("[ARMING] home.valid=false，等待起飞点有效...")
+                logger.warning("[INIT] home.valid=false，等待起飞点有效...")
                 return
 
             # A) 已在 OFFBOARD + 已解锁 → 直接巡航
