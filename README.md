@@ -1,5 +1,4 @@
 # 🚁 OPI-YOLO — 昇腾 NPU 无人机目标检测与闭环控制系统
-### *这是一个小白的个人项目，慎用*
 
 > **硬件平台：** 香橙派 AI Pro（Orange Pi AI Pro）｜**加速单元：** 华为昇腾 Ascend NPU  
 > **通信协议：** ZeroMQ Router/Dealer 架构 ｜ **飞控协议：** MAVLink（PX4 / ArduPilot）  
@@ -8,8 +7,8 @@
 ---
 
 > [!IMPORTANT]
-> **⚡ AI 开发者注意（AI Orientation）**  
-> 本项目已建立现成的 `.codegraph` 代码图谱索引（`.codegraph/codegraph.db`）。后续任何 AI 辅助工具接入时，请**优先使用 `mcp__codegraph` 系列工具**读取该数据库以获得全局代码感知能力（调用链追踪、依赖分析、符号定位），**切勿重复生成独立索引**。索引覆盖 25 个文件、329+ 个符号节点、458+ 条依赖边。
+> **⚡ AI 开发者注意**  
+> 本项目已建立现成的 `.codegraph` 代码图谱索引。后续任何 AI 辅助工具接入时，请**优先使用 `codegraph_explore` 等工具**读取该数据库以获得全局代码感知能力，切勿重复生成独立索引。索引覆盖 28 个文件、452 个符号节点、708 条依赖边。
 
 ---
 
@@ -17,17 +16,11 @@
 
 - [项目简介](#-项目简介)
 - [系统架构](#-系统架构)
-- [模块设计](#-模块设计)
-  - [VideoStreaming — 视频流采集与图传](#1-videostreaming--视频流采集与图传)
-  - [YOLO26UAVInfer — NPU 推理核心](#2-yolo26uavinfer--npu-推理核心)
-  - [TargetTracker — 目标追踪与卡尔曼滤波](#3-targettracker--目标追踪与卡尔曼滤波)
-  - [UAVControlLoop — 飞控闭环控制](#4-uavcontrolloop--飞控闭环控制)
-  - [RouterProxy — ZeroMQ 通信代理](#5-routerproxy--zeromq-通信代理)
-  - [MissionManager — 任务状态机](#6-missionmanager--任务状态机)
-- [环境要求与依赖](#-环境要求与依赖)
-- [配置文件](#-配置文件)
-- [目录结构](#-目录结构)
+- [模块说明](#-模块说明)
+- [状态机流程](#-状态机流程)
 - [快速开始](#-快速开始)
+- [环境要求与依赖](#-环境要求与依赖)
+- [目录结构](#-目录结构)
 - [免责声明](#-免责声明)
 
 ---
@@ -46,7 +39,7 @@
  │ VideoStreaming │ ──►  │ YOLO26UAVInfer   │
  │  帧采集 + 图传  │      │  NPU 推理 + 后处理 │
  └────────────────┘      └────────┬─────────┘
-                                  │ 检测结果 (bbox + score)
+                                  │ 检测结果
                                   ▼
  ┌────────────────┐      ┌──────────────────┐
  │ MissionManager │ ◄──  │  TargetTracker   │
@@ -56,7 +49,7 @@
          ▼                       ▼
  ┌─────────────────────────────────────────┐
  │          UAVControlLoop (20Hz)          │
- │  PID 计算机体速度 → RouterProxy → Router │
+ │  PID → VELOCITY SETPOINT → RouterProxy  │
  └─────────────────────────────────────────┘
                 │
                 ▼
@@ -65,13 +58,48 @@
 
 **关键设计理念：**
 
-- **解耦通信层**：通过 ZeroMQ Router 代理隔离 Python 控制层与 MAVLink 底层，REQ/SUB 双通道实现指令-推送分离
-- **异步流水线**：视频采集、NPU 推理、UDP 图传、飞控控制分属独立线程，互不阻塞
-- **安全优先**：防断流超时刹车（500ms）、卡尔曼 Coast 预测、PID 积分自动清空、Failsafe 人工接管熔断
+- **解耦通信层**：通过 ZeroMQ Router 代理隔离 Python 控制层与 MAVLink 底层
+- **异步流水线**：视频采集、NPU 推理、UDP 图传、飞控控制分属独立线程
+- **安全优先**：防断流刹车（500ms）、卡尔曼 Coast 预测、PID 积分清空、Failsafe 熔断
 
 ---
 
 ## 🏗 系统架构
+
+### 整体架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    MissionOrchestrator                    │
+│    run_mission.py — 全任务编排器                          │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌───────────────────┐    ┌──────────────────────────┐   │
+│  │   MissionManager   │    │      UAVControlLoop       │   │
+│  │   航点巡航状态机    │    │    20Hz VELOCITY 闭环      │   │
+│  │   POSITION SETPOINT│    │    PID + TargetTracker    │   │
+│  │  (非追踪期间)       │    │  (VISUAL_TRACKING 期间)    │   │
+│  └────────┬──────────┘    └───────────┬──────────────┘   │
+│           │                            │                   │
+│           └──────────┬─────────────────┘                   │
+│                      ▼                                     │
+│           ┌──────────────────────┐                        │
+│           │   RouterProxy (ZMQ)   │  共享 ZeroMQ 代理       │
+│           │   REQ + SUB 双通道   │  与 PX4 Router 通信     │
+│           └──────────┬───────────┘                        │
+│                      │                                     │
+│           ┌──────────▼───────────┐                        │
+│           │  ZMQ Router (机载)    │  协议转换层              │
+│           │  ←→ PX4 MAVLink      │                        │
+│           └──────────────────────┘                        │
+│                                                          │
+│  ┌───────────────────┐    ┌──────────────────────────┐   │
+│  │   VideoStreaming   │    │      YOLO26UAVInfer      │   │
+│  │   摄像头/RTSP 采集   │    │   昇腾 NPU 硬件推理       │   │
+│  │   UDP 图传发送      │    │   letterbox + 后处理     │   │
+│  └───────────────────┘    └──────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
 
 ### 通信架构
 
@@ -100,227 +128,140 @@
 
 | type | 方向 | 通道 | 频率 | 说明 |
 |------|------|------|------|------|
-| `SETPOINT` | Python → Router | REQ | 20Hz | 实时 Offboard 控制（NED 位置/速度） |
-| `WAYPOINT` | Python → Router | REQ | 按需 | 航点飞行（GPS + 高度 + 速度 + 动作） |
-| `COMMAND` | Python → Router | REQ | 按需 | ARM / OFFBOARD / LAND / RTL / RESUME |
-| `QUERY` | Python → Router | REQ | 按需 | 查询 HOME_POSITION 等 |
-| `STATE` | Router → Python | PUB | 10Hz | 飞机状态（模式、位置、电量等） |
-| `ALERT` | Router → Python | PUB | 按需 | 紧急告警（低电量、GPS 丢失等） |
-| `PX4_ACK` | Router → Python | PUB | 按需 | PX4 COMMAND_ACK 转发 |
+| `SETPOINT` | Python → Router | REQ | 20Hz | 实时 Offboard 控制 |
+| `WAYPOINT` | Python → Router | REQ | 按需 | 航点飞行 |
+| `COMMAND` | Python → Router | REQ | 按需 | ARM / OFFBOARD / LAND / RTL |
+| `QUERY` | Python → Router | REQ | 按需 | 查询 HOME_POSITION |
+| `STATE` | Router → Python | SUB | 10Hz | 飞机状态推送 |
+| `ALERT` | Router → Python | SUB | 按需 | 紧急告警 |
+| `PX4_ACK` | Router → Python | SUB | 按需 | COMMAND_ACK 转发 |
 
 > 详细协议规范见 [`python_protocol.md`](./python_protocol.md)
 
----
+### 控制权协调规则
 
-## 🔧 模块设计
+同一时刻只有一方持有 **SETPOINT 发令权**：
 
-### 1. VideoStreaming — 视频流采集与图传
-
-**文件：** `infer_camera_modular.py:31` ｜ `class VideoStreaming`
-
-负责视频帧的**双线程异步采集**与**UDP 图传**。
-
-| 特性 | 说明 |
-|------|------|
-| **独立采集线程** | 后台 `_capture_worker` 线程持续从摄像头/RTSP 读取帧，永不阻塞主循环 |
-| **单帧缓冲区** | `queue.Queue(maxsize=1)` 仅保留最新帧，积压帧自动丢弃（避免延迟累积） |
-| **RTSP 低延迟** | `CAP_PROP_BUFFERSIZE=1` + 自动追加 `?tcp` 传输模式 |
-| **自动重连** | 读取失败 → 释放资源 → 1 秒后重新连接循环，断流后自主恢复 |
-| **UDP 图传** | 独立 `sender_thread` 线程 JPEG 压缩后以 UDP 推流至地面站（默认 `:9999`），超 65KB 自动跳过 |
-
-### 2. YOLO26UAVInfer — NPU 推理核心
-
-**文件：** `infer_camera_modular.py:187` ｜ `class YOLO26UAVInfer`
-
-基于华为昇腾 `ais_bench` SDK（`InferSession`）的推理封装。
-
-| 阶段 | 说明 |
-|------|------|
-| **图像预处理** | `letterbox()` — 保持宽高比的缩放 + 灰边填充（640×640），适配 NPU 固定输入 |
-| **张量转换** | `preprocess()` — HWC → CHW、归一化到 `[0,1]`、`float32`、添加 batch 维度 |
-| **NPU 推理** | `InferSession(device_id, model_path).infer()` — 异步硬件推理 |
-| **坐标回映射** | `postprocess()` — 置信度阈值过滤 → Letterbox 逆变换 → 原图坐标裁剪 |
-| **可视化** | `draw_boxes()` — 在帧上渲染检测框 + 置信度标签 |
-
-### 3. TargetTracker — 目标追踪与卡尔曼滤波
-
-**文件：** `drone_controller/target_tracker.py:42` ｜ `class _KalmanBoxFilter` / `class TargetTracker`
-
-基于恒定速度卡尔曼滤波实现单目标追踪，解决 YOLO 帧间抖动和短时遮挡问题。
-
-| 组件 | 说明 |
-|------|------|
-| **卡尔曼滤波器** | 8 维状态 `[cx, cy, w, h, vx, vy, vw, vh]`，过程/观测噪声与目标尺寸动态关联 |
-| **Tracklet 轨道** | 记录 `track_id`、连续丢失计数、匹配命中次数、生存帧数 |
-| **数据关联** | 基于 IOU 的匈牙利匹配（`linear_assignment`），支持 `max_lost_frames` 帧内 coast |
-| **Coast 预测** | 目标短暂丢失时靠卡尔曼预测持续输出位置，超阈值后判定目标死亡 |
-| **命中验证** | `min_hits` 击发机制：新目标需连续匹配 N 帧才确认为有效轨道 |
-
-### 4. UAVControlLoop — 飞控闭环控制
-
-**文件：** `infer_camera_modular.py:266` ｜ `class UAVControlLoop`
-
-**20Hz 高频控制线程**，通过 ZeroMQ RouterProxy 间接操控飞控。
-
-```
-┌─ 主循环 ─────────────────┐
-│ update_detections()       │──→ 写入共享检测结果（锁保护）
-└───────────────────────────┘
-           │
-┌─ 控制线程 (20Hz) ─────────┐
-│ _compute_velocity()        │──→ PID 计算机体速度 (vy, vz)
-│ proxy.send_setpoint()      │──→ ZMQ REQ → Router → PX4
-└───────────────────────────┘
-```
-
-**安全设计：**
-
-| 机制 | 说明 |
-|------|------|
-| **20Hz 保活心跳** | 控制线程以固定 20Hz 循环发送 SETPOINT，满足 Offboard 协议 ≥20Hz 要求 |
-| **防断流刹车** | `_last_update_time` 超过 **500ms** 未更新 → `_brake_requested=True` → 强制零速刹车 |
-| **PID 积分清空** | 目标丢失时调用 `pid_y.reset()` / `pid_z.reset()`，防止积分 windup 导致失控 |
-| **起飞序列自动化** | `start_uav()`：启动 ZMQ → 等待 STATE → ARM → TAKEOFF → OFFBOARD 预热 → 启动控制线程 |
-
-### 5. RouterProxy — ZeroMQ 通信代理
-
-**文件：** `drone_controller/router_proxy.py:49` ｜ `class RouterProxy`
-
-Python 控制层与外部 Router 进程之间的通信桥梁。
-
-| 功能 | 说明 |
-|------|------|
-| **REQ 通道** | `send_setpoint()` / `send_command()` / `send_query()` / `send_waypoint()` 四种指令接口 |
-| **SUB 通道** | 后台 `_sub_worker` 持续监听 STATE / ALERT / PX4_ACK 推送 |
-| **STATE 缓存** | `_latest_state` 受锁保护的线程安全缓存 + 深度拷贝读取 |
-| **新鲜度检测** | `is_state_fresh()` — 500ms 新鲜度阈值 + 2s 警告阈值（协议 §3.8.1） |
-| **异常重建** | `_recover_req()` — REQ 超时或异常时自动重建 ZMQ socket（含 REQ_RELAXED+CORRELATE 兼容） |
-| **回调钩子** | `set_state_callback()` / `set_alert_callback()` — 可注册外部回调处理推送消息 |
-
-### 6. MissionManager — 任务状态机
-
-**文件：** `drone_controller/mission_manager.py:24` ｜ `class MissionManager`
-
-面向航点巡航 + 视觉追踪融合任务的复合状态机。
-
-```
-INIT → ARMING → TAKEOFF → NAVIGATING → HOLD_TASK ──→ VISUAL_TRACKING ──→ (继续巡航)
-                                  │                      │                      │
-                                  └── (无目标超时) ────────┘                      │
-                                                                                ▼
-                                                          RETURNING → LANDING → FINISHED
-                                                                                    或
-                                                          HOLD_FINAL (不回航时) ─── FINISHED
-```
-
-| 特性 | 说明 |
-|------|------|
-| **Failsafe 熔断** | 检测到飞控模式被切出 GUIDED/OFFBOARD 时立即抛出 `FailsafeTriggered` 异常，暴力熔断主循环 |
-| **视觉追踪超时** | 追踪持续 5 秒视为任务完成（`_is_tracking_task_complete`，可自定义） |
-| **悬停检索** | 到达航点后进入 HOLD_TASK，在规定时间内等待视觉发现目标 |
-| **返航策略** | 支持 `return_to_home=True/False`，可选择返航降落或末端悬停 |
+| 状态机状态 | 控制者 | 控制模式 |
+|-----------|--------|---------|
+| 非 `VISUAL_TRACKING` | MissionManager | POSITION（经纬度 lat/lon + 高度） |
+| `VISUAL_TRACKING` | UAVControlLoop | VELOCITY（机体速度 m/s） |
 
 ---
 
-## 📦 环境要求与依赖
+## 🔧 模块说明
 
-### 硬件平台
+### 核心入口
 
-| 组件 | 规格 |
+| 文件 | 说明 |
 |------|------|
-| **主控** | 香橙派 AI Pro（Orange Pi AI Pro）或兼容昇腾平台 |
-| **NPU** | 华为昇腾 Ascend 310B / 同等算力单元 |
-| **摄像头** | USB 摄像头 或 RTSP 网络摄像头 |
-| **飞控** | PX4 / ArduPilot 固件兼容飞控（串口连接） |
+| `run_mission.py` | **主任务入口**。实例化所有子系统，20Hz 主循环协调 MissionManager 状态机与 UAVControlLoop 控制权，含 HUD 渲染、CSV 飞行日志、TCP 远程急停 |
+| `infer_camera_modular.py` | **模块化推理入口**。独立运行的 NPU 推理+控制程序，含 USB/RTSP 自动重连 |
+| `infer_camera.py` | 推理程序（pymavlink 直连旧版） |
+| `infer_camera_direct.py` | 推理程序（DroneController 直连旧版） |
+| `infer_video_direct.py` | 离线视频推理程序 |
+| `gent_mission.py` | 航点巡航+视觉追踪融合版（直连 pymavlink 旧版） |
 
-### 软件依赖
+### drone_controller/ — 核心业务层
 
-| 依赖 | 用途 | 最低版本 |
-|------|------|----------|
-| `ais_bench` | 昇腾 NPU 推理 SDK | 最新稳定版 |
-| `opencv-python` | 视频采集、图像预处理、可视化渲染 | ≥4.5 |
-| `pyzmq` | ZeroMQ 通信（REQ/SUB 协议） | ≥22 |
-| `numpy` | 张量操作、卡尔曼滤波矩阵运算 | ≥1.21 |
-| `pymavlink` | MAVLink 协议（DroneController 模式） | 最新版 |
+| 文件 | 类/功能 | 说明 |
+|------|---------|------|
+| `mission_manager.py` | `MissionManager`, `MissionState`, `FailsafeTriggered` | **航点巡航状态机** — 封装完整任务生命周期（INIT→ARMING→TAKEOFF→NAVIGATING→HOLD_TASK→VISUAL_TRACKING→RETURNING→LANDING→FINISHED），所有 SETPOINT 通过 RouterProxy 发送 |
+| `router_proxy.py` | `RouterProxy` | **ZMQ 通信代理** — 封装 REQ/SUB 协议，提供 `send_setpoint()`、`send_command()`、`send_waypoint()`、`get_latest_state()` 等线程安全接口，含 STATE 新鲜度检测 |
+| `target_tracker.py` | `TargetTracker`, `_KalmanBoxFilter` | **目标追踪过滤器** — 恒定速度卡尔曼滤波，支持 IOU 关联、coast 预测、ID 稳定 |
+| `pid_counter.py` | `PID` | **PID 控制器** — 标准比例-积分-微分调节器，支持积分限幅和手动复位 |
+| `base_control.py` | `DroneController` | **底层 MAVLink 驱动** — 直连串口/UDP 的 PX4/ArduPilot 驱动（旧版，现推荐使用 RouterProxy） |
 
-### 昇腾环境变量
+### utils/ — 工具模块
 
-```bash
-# 香橙派 AI Pro 需加载（脚本已自动处理）
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-```
+| 文件 | 功能 |
+|------|------|
+| `coord.py` | `haversine()` 球面距离、`dist_3d_latlon()` 3D 距离、`latlon_to_ned()` NED 坐标转换 |
+
+### 其他
+
+| 文件 | 说明 |
+|------|------|
+| `control.py` | 简单 pymavlink 飞行控制脚本 |
+| `tcp_client.py` | TCP 命令通道测试客户端 |
+| `transform_app.py` | 地面站数据中继/转发服务 |
+| `videotest.py` | 摄像头打开测试 |
+| `base_test/` | 基础测试（NPU 推理、飞控通信、UDP 接收等） |
+
+### 模块详解
+
+#### VideoStreaming — 视频流采集与图传
+
+**文件：** `infer_camera_modular.py:34` ｜ `class VideoStreaming`
+
+独立线程从摄像头/RTSP 采集帧，单帧缓冲区 `Queue(maxsize=1)` 避免延迟累积，通过独立线程 UDP 推流至地面站。
+
+**自动重连机制：**
+- 每轮 5 次快速重试，间隔 1 秒
+- 5 次全部失败 → 30 秒冷却期
+- 分段睡眠确保线程停止信号秒级响应
+
+#### YOLO26UAVInfer — NPU 推理核心
+
+**文件：** `infer_camera_modular.py:190` ｜ `class YOLO26UAVInfer`
+
+基于华为昇腾 `ais_bench` SDK（`InferSession`）的推理封装。`letterbox()` 等比例缩放填充 + `postprocess()` 坐标回映射。
+
+#### UAVControlLoop — 飞控闭环控制
+
+**文件：** `infer_camera_modular.py:269` ｜ `class UAVControlLoop`
+
+20Hz 独立线程：`TargetTracker` 平滑中心点 → PID 计算机体速度 `(vy, vz)` → `send_setpoint(VELOCITY)`。
+
+**安全设计：** 防断流刹车（500ms）+ Coast 预测期 PID 积分清空
+
+#### MissionManager — 任务状态机
+
+**文件：** `drone_controller/mission_manager.py:64` ｜ `class MissionManager`
+
+面向航点巡航 + 视觉追踪融合任务的复合状态机：
+
+- **Failsafe 熔断**：检测到飞控模式被切出白名单时立即抛出异常
+- **Haversine 距离判定**：使用经纬度球面距离进行到达判定
+- **事件驱动日志**：状态切换单次输出，持续状态 3~10 秒节流
 
 ---
 
-## ⚙ 配置文件
-
-`config.json` 集中管理系统配置：
-
-```json
-{
-    "model": {
-        "model_path": "./om/yolo26n-balloon2.om",   // OM 模型路径
-        "conf_threshold": 0.25,                       // 置信度阈值
-        "device_id": 0                                // NPU 设备 ID
-    },
-    "video": {
-        "video_source": "rtsp://192.168.144.25:8554/main.264",  // 视频源（0=USB 摄像头）
-        "jpeg_quality": 75                                      // 图传 JPEG 质量
-    },
-    "network": {
-        "ground_station_ip": "192.168.31.221",  // 地面站 IP
-        "udp_port": 9999                         // 图传 UDP 端口
-    },
-    "flight_control": {
-        "req_endpoint": "tcp://127.0.0.1:5555",  // ZMQ REQ 地址
-        "sub_endpoint": "tcp://127.0.0.1:5556",  // ZMQ SUB 地址
-        "takeoff_alt": 5.0,                       // 起飞目标高度 (m)
-        "control_hz": 20,                         // 控制频率 (Hz)
-        "target_tracker": {
-            "max_lost_frames": 8,                 // 最大连续丢失帧数
-            "max_asscociation_dist": 200.0,       // 最大关联距离 (px)
-            "min_hits": 3                         // 最小命中确认数
-        }
-    },
-    "pid_y": { "kp": 1.0, "ki": 0.02, "kd": 0.3, "max_out": 0.8, "min_out": -0.8 },
-    "pid_z": { "kp": 1.0, "ki": 0.02, "kd": 0.3, "max_out": 0.4, "min_out": -0.4 }
-}
-```
-
----
-
-## 📁 目录结构
+## 🔄 状态机流程
 
 ```
-opi-yolo/
-├── infer_camera_modular.py    # 🚀 主入口：模块化视觉追踪（推荐运行入口）
-├── infer_camera_direct.py     # 直接调用控制（旧版，走 MAVLink 直连）
-├── gent_mission.py            # 航点巡航 + 视觉追踪融合版
-├── run_mission.py             # 自动巡点飞行业务测试
-├── control.py                 # PID + MAVLink 指令（旧版，直连飞控模式）
-├── config.json                # 项目全局配置文件
-├── python_protocol.md         # Python ↔ Router 通信协议规范
-├── start_npu_infer.sh         # 🔁 NPU 推理开机自启脚本（崩溃自动重启）
-├── videotest.py               # 视频源连通性测试
-├── README.md                  # 本文件
-│
-├── drone_controller/
-│   ├── router_proxy.py        # ZMQ REQ/SUB 通信代理（当前主力通信方式）
-│   ├── target_tracker.py      # 卡尔曼滤波目标追踪器
-│   ├── mission_manager.py     # 航点任务状态机
-│   ├── base_control.py        # MAVLink 底层驱动（旧版，已弃置）
-│   └── pid_counter.py         # PID 计算器（抽离版）
-│
-├── base_test/
-│   ├── check.py               # 视频帧率测试
-│   ├── fc_test.py             # 飞控通信测试
-│   ├── infer.py               # 图片推理测试
-│   └── receiver.py            # UDP 图传接收模拟以及简易的JPEG转换为H.264线程实现
-│
-├── om/                        # 昇腾 OM 模型文件存放目录
-│   └── yolo26n-balloon2.om
-│
-└── asset/                     # 基础测试资源文件
+WAITING_WAYPOINTS
+       │  收到航点
+       ▼
+    INIT ───────────────────────────────┐
+       │  ARM OK                        │ 已OFFBOARD
+       ▼                                │
+    ARMING                              │
+       │  解锁成功                       │
+       ▼                                │
+    TAKEOFF                             │
+       │  到达高度 + OFFBOARD            │
+       ▼                                │
+    NAVIGATING ──────── 所有航点完成 ────┤
+       │                                 │
+       │ 到达航点                         │
+       ▼                                 │
+    HOLD_TASK                            │
+       │  ├─ 发现目标 → VISUAL_TRACKING   │
+       │  └─ 超时     → 下一航点          │
+       ▼                                 │
+    VISUAL_TRACKING                      │
+       │  ├─ 追踪完成 → NAVIGATING        │
+       │  ├─ 丢失超时 → NAVIGATING        │
+       │  └─ 总超时   → NAVIGATING        │
+       ▼                                 │
+    RETURNING ←──────────────────────────┘
+       │  到达返航点
+       ▼
+    LANDING
+       │  着陆 + 上锁
+       ▼
+    FINISHED
 ```
 
 ---
@@ -330,40 +271,116 @@ opi-yolo/
 ### 1. 环境准备
 
 ```bash
-# 加载昇腾环境（香橙派 AI Pro 必须）
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-
-# 激活 Python 环境
-conda activate base
+# 创建虚拟环境
+python -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
 # 安装依赖
-pip install opencv-python pyzmq numpy pymavlink ais_bench
+pip install -r requirements.txt
+
+# 香橙派 AI Pro 加载昇腾环境
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 ```
 
 ### 2. 配置
 
-编辑 `config.json`，根据实际部署修改：
-- `video.video_source`：摄像头设备号（`0`）或 RTSP 地址
-- `flight_control.req/sub_endpoint`：ZeroMQ 端点地址
-- `network.ground_station_ip`：地面站 IP（图传接收端）
+编辑 `config.json`，根据实际部署修改关键参数：
+- `video.video_source` — 摄像头设备号（`0`）或 RTSP 地址
+- `flight_control.req_endpoint` / `sub_endpoint` — ZeroMQ Router 端点
+- `network.ground_station_ip` — 地面站 IP（图传接收）
 
 ### 3. 运行
 
 ```bash
-# 模块化视觉追踪（推荐）
-python infer_camera_modular.py
+# 完整任务模式（航点巡航 + 视觉追踪）
+python run_mission.py config.json
 
-# 或使用自启脚本（崩溃自动重启）
-chmod +x start_npu_infer.sh
-./start_npu_infer.sh
+# 独立模块化视觉追踪
+python infer_camera_modular.py config.json
 
-# 或航点巡航 + 视觉追踪融合
-python gent_mission.py
+# 离线视频推理
+python infer_video_direct.py
 ```
 
-### 4. 地面站接收图传
+### 4. TCP 远程控制
 
-在 `ground_station_ip` 对应的机器上运行 UDP 接收端（参考 `base_test/receiver.py`）查看实时图传画面。
+```bash
+echo "STOP" | nc <设备IP> 9999     # 紧急降落
+echo "STATUS" | nc <设备IP> 9999   # 查询状态
+echo "PING" | nc <设备IP> 9999     # 心跳测试
+```
+
+### 5. 地面站接收图传
+
+参考 `base_test/receiver.py` 在 `ground_station_ip` 对应机器上运行 UDP 接收端。
+
+---
+
+## 📦 环境要求与依赖
+
+### 硬件平台
+
+| 组件 | 规格 |
+|------|------|
+| **主控** | 香橙派 AI Pro（Orange Pi AI Pro） |
+| **NPU** | 华为昇腾 Ascend 310B |
+| **摄像头** | USB 摄像头 或 RTSP 网络摄像头 |
+| **飞控** | PX4 / ArduPilot（串口或 UDP 连接 Router） |
+
+### Python 依赖
+
+完整依赖见 [`requirements.txt`](./requirements.txt)
+
+| 依赖 | 用途 | 备注 |
+|------|------|------|
+| `opencv-python` | 视频采集、图像预处理、渲染 | ≥4.5 |
+| `pyzmq` | ZeroMQ REQ/SUB 通信 | ≥22 |
+| `numpy` | 张量操作、矩阵运算 | ≥1.21 |
+| `pymavlink` | MAVLink 协议（旧版直连模式） | 最新版 |
+| `ais_bench` | 昇腾 NPU 推理 SDK | 需从华为昇腾官方安装 |
+
+---
+
+## 📁 目录结构
+
+```
+opi-yolo/
+├── infer_camera_modular.py     # 🚀 模块化视觉追踪（推荐入口）
+├── infer_camera_direct.py      # 直连 MAVLink 旧版
+├── infer_camera.py             # 直连 pymavlink 旧版
+├── infer_video_direct.py       # 离线视频推理
+├── run_mission.py              # 🚀 全任务入口（航点+追踪）
+├── gent_mission.py             # 航点巡航+追踪融合（旧版）
+├── control.py                  # 简单飞控控制脚本
+├── config.json                 # 全局配置文件
+├── python_protocol.md          # 通信协议规范
+├── tcp_client.py               # TCP 命令通道客户端
+├── transform_app.py            # 地面站数据中继
+├── videotest.py                # 摄像头测试
+├── README.md                   # 本文档
+├── requirements.txt            # Python 依赖清单
+│
+├── drone_controller/
+│   ├── mission_manager.py      # 航点巡航状态机
+│   ├── router_proxy.py         # ZMQ 通信代理
+│   ├── target_tracker.py       # 卡尔曼目标追踪
+│   ├── pid_counter.py          # PID 控制器
+│   └── base_control.py         # MAVLink 底层驱动（旧版）
+│
+├── utils/
+│   └── coord.py                # 坐标转换工具
+│
+├── base_test/
+│   ├── check.py                # 视频帧率测试
+│   ├── fc_test.py              # 飞控通信测试
+│   ├── infer.py                # NPU 推理测试
+│   └── receiver.py             # UDP 图传接收器
+│
+├── om/                         # OM 模型文件
+│   └── yolo26n-balloon2.om
+│
+└── asset/                      # 资源文件
+```
 
 ---
 
@@ -377,9 +394,3 @@ python gent_mission.py
 > 5. 遵守当地无人机飞行法规
 >
 > 本项目作者不对因使用本软件造成的任何财产损失或人身伤害承担责任。
-
----
-
-> [!IMPORTANT]
-> **⚡ AI 开发者注意（AI Orientation）**  
-> 本项目已建立现成的 `.codegraph` 代码图谱索引（`.codegraph/codegraph.db`）。后续任何 AI 辅助工具接入时，请**优先使用 `mcp__codegraph` 系列工具**读取该数据库以获得全局代码感知能力（调用链追踪、依赖分析、符号定位），**切勿重复生成独立索引**。索引覆盖 25 个文件、329+ 个符号节点、458+ 条依赖边。

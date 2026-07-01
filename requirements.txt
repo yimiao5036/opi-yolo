@@ -1,0 +1,35 @@
+# ============================================================
+# opi-yolo — 第三方 Python 依赖
+# 安装: pip install -r requirements.txt
+# 注: ais_bench 需从华为昇腾官方渠道单独安装
+# ============================================================
+
+# ---- 核心依赖 ----
+
+# 计算机视觉：视频采集、图像预处理、可视化渲染
+opencv-python>=4.5.0
+
+# 数值计算：张量操作、卡尔曼滤波矩阵运算
+numpy>=1.21.0
+
+# ZeroMQ 通信：REQ/SUB 协议栈（与机载 Router 进程通信）
+pyzmq>=22.0.0
+
+# MAVLink 协议栈（旧版基础控制模式使用）
+pymavlink>=2.4.0
+
+# ---- 昇腾 NPU 推理（需从华为官方安装） ----
+# ais_bench 是华为昇腾 AI SDK 的推理接口，
+# 请参考昇腾文档安装 CANN 软件包后使用 pip 安装:
+#   pip install /usr/local/Ascend/ascend-toolkit/latest/lib64/te-*.whl
+#   pip install ais_bench
+# 或参照: https://www.hiascend.com/documentation
+
+# ---- 可选依赖 ----
+
+# 图传接收端（base_test/receiver.py）所需：
+# imageio-ffmpeg  # 视频流解码
+# av              # PyAV 编解码
+
+# 地面站转发服务（transform_app.py）所需：
+# （均为 Python 标准库: socket, json, threading, zlib, hashlib, hmac）
