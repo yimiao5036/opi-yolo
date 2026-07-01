@@ -329,7 +329,6 @@ class MissionManager:
           B) 未解锁 → 发 ARM 指令
           C) 已解锁但非 OFFBOARD → 进入 ARMING 等待后续 TAKEOFF 序列
         """
-        global need_homeLog
         try:
             drone = state["drone"]
             armed = drone.get("armed", False)
@@ -340,9 +339,8 @@ class MissionManager:
             logger.info("[INIT] mode=%s armed=%s alt_rel=%.1fm",
                         mode, armed, alt_rel)
 
-            if not home.get("valid", False) and need_homeLog:
+            if not home.get("valid", False):
                 logger.warning("[INIT] home.valid=false，等待起飞点有效...")
-                need_homeLog = False
                 return
 
             # A) 已在 OFFBOARD + 已解锁 → 直接巡航
@@ -379,11 +377,9 @@ class MissionManager:
         """
         [ARMING] 等待解锁确认，成功后进入 TAKEOFF
         """
-        global need_homeLog
         try:
             armed = state["drone"].get("armed", False)
             home = state.get("home", {})
-            need_homeLog = True
 
             if not armed:
                 elapsed = time.time() - self._state_start_time
@@ -395,9 +391,8 @@ class MissionManager:
                     logger.info("[ARMING] 等待解锁... (%.1fs)", elapsed)
                 return
 
-            if not home.get("valid", False) and need_homeLog:
+            if not home.get("valid", False):
                 logger.warning("[ARMING] home.valid=false，等待起飞点有效...")
-                need_homeLog = False
                 return
 
             # ---- 解锁成功 → 起飞 ----
