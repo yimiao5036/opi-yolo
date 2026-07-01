@@ -356,8 +356,7 @@ class MissionManager:
             alt_rel = drone.get("alt_rel", 0.0)
             home = state.get("home", {})
 
-            logger.info("[INIT] mode=%s armed=%s alt_rel=%.1fm",
-                        mode, armed, alt_rel)
+            self._throttle_log("init",5.0,"[INIT] mode=%s armed=%s alt_rel=%.1fm",mode, armed, alt_rel)
 
             if not home.get("valid", False):
                 self._throttle_log("home_valid_init", 5.0,
@@ -409,7 +408,8 @@ class MissionManager:
                     self.proxy.send_command("ARM")
                     self._state_start_time = time.time()
                 else:
-                    logger.info("[ARMING] 等待解锁... (%.1fs)", elapsed)
+                    self._throttle_log("arming_wait", 3.0,
+                                       "[ARMING] 等待解锁... (%.1fs)", elapsed)
                 return
 
             if not home.get("valid", False):
