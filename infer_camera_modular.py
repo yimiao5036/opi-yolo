@@ -349,6 +349,10 @@ class UAVControlLoop:
         self._last_vy = 0.0
         self._last_vz = 0.0
 
+        # ---- 日志节流控制 ----
+        self._log_throttle = {}  # key → 上次打印时间戳
+        self._brake_last_logged = False  # 刹车是否已输出过日志
+
     def start_uav(self):
         """连接 Router，执行标准起飞序列（协议 §3.3.1）
 
@@ -585,7 +589,12 @@ class UAVControlLoop:
             # 主线程超过 500ms 未更新 → 强制判丢（覆盖摄像头断流/主线程卡死）
             if time.time() - last_update > 0.5:
                 tracked = None
-                self.logger.warning("主线程超过 500ms 未更新检测结果，强制判丢")
+                # 节流：每 5 秒输出一次断流警告，不刷屏
+                now = time.time()
+                last_warn = self._log_throttle.get("antistale", 0)
+                if now - last_warn > 5.0:
+                    self._log_throttle["antistale"] = now
+                    self.logger.warning("主线程超过 500ms 未更新检测结果，强制判丢")
 
             # ---- ③ 解析跟踪结果 → 速度指令（使用跟踪器输出的平滑中心点） ----
             vx, vy, vz = self._velocity_from_tracker(tracked, w, h)
@@ -600,7 +609,12 @@ class UAVControlLoop:
                     # 同时清空 PID（确保 PD 也归零）
                     self.pid_y.reset()
                     self.pid_z.reset()
-                    self.logger.info("刹车指令已发送（控制线程执行）")
+                    # 仅第一次刹车输出日志，后续连续刹车静默
+                    if not self._brake_last_logged:
+                        self._brake_last_logged = True
+                        self.logger.info("刹车指令已发送（控制线程执行）")
+                else:
+                    self._brake_last_logged = False
 
             # ---- 记录当前速度指令（供外部日志读取） ----
             self._last_vx, self._last_vy, self._last_vz = vx, vy, vz
@@ -654,9 +668,6 @@ class UAVControlLoop:
         vy = self.pid_y.update(err_x)   # 左右移动
         vz = self.pid_z.update(err_y)   # 上下移动（NED 中正为下）
         vx = 0.0                        # 前后维持不变
-
-        self.logger.debug("PID 计算: err_x=%.3f err_y=%.3f vy=%.3f vz=%.3f",
-                          err_x, err_y, vy, vz)
 
         # ---- 滑行预测期间：强制清空积分项 ----
         # 双重保险（update_detections 中也有一道）：

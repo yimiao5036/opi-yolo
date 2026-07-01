@@ -184,6 +184,10 @@ class MissionManager:
                      self.arrival_radius, self.hold_duration,
                      self.return_to_home)
 
+        # ---- 日志节流控制 ----
+        self._last_throttle_time = {}  # 节流日志: key → 上次打印时间戳
+        self._last_throttle_state = {}  # 状态缓存对比: key → 上次打印的值
+
     # ================================================================
     #  主入口
     # ================================================================
@@ -313,6 +317,24 @@ class MissionManager:
             return -state["drone"].get("alt_rel", 0.0)
         except (KeyError, TypeError):
             return self.target_altitude
+
+    # ---- 日志节流辅助 ----
+
+    def _throttle_log(self, key, interval, msg, *args, level=logging.INFO):
+        """节流日志：同一 key 在 interval 秒内只输出一次"""
+        now = time.time()
+        last = self._last_throttle_time.get(key, 0)
+        if now - last >= interval:
+            self._last_throttle_time[key] = now
+            logger.log(level, msg, *args)
+
+    def _throttle_log_on_change(self, key, current_value, msg, *args,
+                                 level=logging.INFO):
+        """状态变化日志：仅当 current_value 与上次记录不同时输出一次"""
+        last = self._last_throttle_state.get(key, object())
+        if last != current_value:
+            self._last_throttle_state[key] = current_value
+            logger.log(level, msg, *args)
 
     # ================================================================
     #  状态处理器
@@ -497,8 +519,10 @@ class MissionManager:
                 self._set_current_target_from_wp(0)
                 return
 
-            logger.info("[起飞中] alt=%.1f/%.1f mode=%s 耗时=%.1fs",
-                        alt_rel, target_up, mode, elapsed)
+            # 节流：每 3 秒输出一次高度进度，不刷屏
+            self._throttle_log("takeoff", 3.0,
+                               "[起飞中] alt=%.1f/%.1f mode=%s 耗时=%.1fs",
+                               alt_rel, target_up, mode, elapsed)
 
         except (KeyError, TypeError) as e:
             logger.warning("[TAKEOFF] 异常: %s", e)
@@ -567,8 +591,11 @@ class MissionManager:
             self.state = MissionState.HOLD_TASK
             self.hold_start_time = time.time()
         else:
-            logger.info("[巡航中] 航点 [%d/%d] 距离=%.2fm",
-                        self.current_wp_index + 1, len(self.waypoints), dist)
+            # 节流：每 5 秒输出一次巡航进度，不刷屏
+            self._throttle_log("navigating", 5.0,
+                               "[巡航中] 航点 [%d/%d] 距离=%.2fm",
+                               self.current_wp_index + 1,
+                               len(self.waypoints), dist)
 
     def _finish_navigation(self):
         """所有航点飞完后的跳转"""
@@ -624,9 +651,11 @@ class MissionManager:
             self.current_wp_index += 1
             self.state = MissionState.NAVIGATING
         else:
-            logger.info("[检索中] 航点 %d 剩余 %.1fs",
-                        self.current_wp_index + 1,
-                        self.hold_duration - elapsed)
+            # 静默悬停检索，不刷屏；仅每 3 秒轻量心跳
+            self._throttle_log("hold_task", 3.0,
+                               "[检索中] 航点 %d 剩余 %.1fs",
+                               self.current_wp_index + 1,
+                               self.hold_duration - elapsed)
 
     # ---- 视觉追踪 ----
 
@@ -675,12 +704,22 @@ class MissionManager:
                                 lost_elapsed)
                     self._exit_tracking()
                     return
-                logger.info("[追踪中] 丢失 %.1fs/%.1fs",
-                            lost_elapsed, self.target_lost_timeout)
+            # 节流：每 2 秒输出一次丢失状态（不刷屏）
+            self._throttle_log("track_lost", 2.0,
+                               "[追踪中] 丢失 %.1fs/%.1fs",
+                               lost_elapsed if self._target_lost_start
+                               else 0.0,
+                               self.target_lost_timeout)
         else:
+            # 目标重新出现时，单次日志（事件驱动）
+            self._throttle_log_on_change("track_lost_clear",
+                                         self._target_lost_start is not None,
+                                         "[追踪中] 目标恢复")
             self._target_lost_start = None
 
-        logger.info("[追踪中] 进行中... %.1fs", tracking_elapsed)
+        # 节流：每 5 秒输出一次追踪心跳，20Hz 静默
+        self._throttle_log("track_heartbeat", 5.0,
+                           "[追踪中] 进行中... %.1fs", tracking_elapsed)
 
     def _exit_tracking(self):
         """退出 VISUAL_TRACKING 的统一出口"""
@@ -706,7 +745,9 @@ class MissionManager:
         current_z = self._get_current_z(state)
         dist = _dist_3d(self._est_x, self._est_y, current_z,
                         0.0, 0.0, self.target_altitude)
-        logger.info("[返航中] 距离=%.2fm", dist)
+        # 节流：每 3 秒输出一次返航距离，不刷屏
+        self._throttle_log("returning", 3.0,
+                           "[返航中] 距离=%.2fm", dist)
 
         if dist < self.arrival_radius:
             logger.info("\n[到达] 已返回起始点，发送 LAND 指令...")
@@ -725,8 +766,10 @@ class MissionManager:
         try:
             armed = state["drone"].get("armed", False)
             alt_rel = state["drone"].get("alt_rel", 0.0)
-            logger.info("[降落中] 高度=%.1fm 已解锁=%s",
-                        alt_rel, not armed)
+            # 节流：每 3 秒输出一次高度，不刷屏
+            self._throttle_log("landing", 3.0,
+                               "[降落中] 高度=%.1fm 已解锁=%s",
+                               alt_rel, not armed)
 
             if not armed:
                 logger.info("\n[完结] 已着陆上锁，任务结束")
@@ -757,9 +800,11 @@ class MissionManager:
             "z": final_wp.get("z", self.target_altitude),
             "yaw": final_wp.get("yaw", 0),
         }
-        logger.info("[挂起] 保持 (%.1f, %.1f, %.1f) 等待接管",
-                    final_wp["x"], final_wp["y"],
-                    final_wp.get("z", self.target_altitude))
+        # 节流：每 10 秒输出一次末端悬停状态，不刷屏
+        self._throttle_log("hold_final", 10.0,
+                           "[挂起] 保持 (%.1f, %.1f, %.1f) 等待接管",
+                           final_wp["x"], final_wp["y"],
+                           final_wp.get("z", self.target_altitude))
 
     # ================================================================
     #  辅助
