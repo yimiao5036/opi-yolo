@@ -42,6 +42,8 @@ class VideoStreaming:
 
         # RTSP 特殊参数
         self.is_rtsp = isinstance(self.video_source, str) and self.video_source.startswith("rtsp://")
+        # FFMPEG RTSP 传输协议统一设为 TCP（只设一次，避免每轮重试重复设置）
+        os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
         self.cap = None
         self.frame_buffer = queue.Queue(maxsize=1)   # 只保留最新一帧
         self.is_running = True
@@ -67,8 +69,8 @@ class VideoStreaming:
             # _open_camera() 内部自带带退避的无限重试，阻塞直到成功或被停止
             if self.cap is None or not self.cap.isOpened():
                 self._open_camera()
-                continue    # 回到 while 头部检查 is_running 并读取帧
-
+                if self.cap is None or not self.cap.isOpened():
+                    continue
             ret, frame = self.cap.read()
             if not ret:
                 # 读取失败，关闭并标记需重连
@@ -92,18 +94,17 @@ class VideoStreaming:
         if self.cap is not None:
             self.cap.release()
 
-    @staticmethod
-    def _interruptible_sleep(duration, interval=1.0):
+    def _interruptible_sleep(self, duration, interval=1.0):
         """
-        分段睡眠，每 interval 秒检查一次线程退出条件。
-        替代 time.sleep(duration)，确保能秒级响应停止信号。
+        分段睡眠，每 interval 秒检查一次 self.is_running。
+        替代 time.sleep(duration)，确保线程停止时秒级退出。
 
         Args:
             duration:  总睡眠时间（秒）
             interval:  每段睡眠时长（秒），默认 1 秒
         """
         end_time = time.time() + duration
-        while time.time() < end_time:
+        while time.time() < end_time and self.is_running:
             remaining = min(interval, end_time - time.time())
             if remaining <= 0:
                 break
@@ -156,7 +157,6 @@ class VideoStreaming:
                 try:
                     self.logger.info("正在连接视频源: %s (尝试 %d/%d)",
                                      self.video_source, attempt, RETRIES_PER_ROUND)
-                    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
                     self.cap = cv2.VideoCapture(self.video_source, cv2.CAP_FFMPEG)
 
                     if self.is_rtsp:
