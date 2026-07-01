@@ -166,8 +166,8 @@ class VideoStreaming:
                             self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
                         except Exception:
                             pass  # 编码设置失败不影响连接
-                        if "?" not in self.video_source:
-                            self.video_source += "?tcp"
+                        # if "?" not in self.video_source:
+                        #     self.video_source += "?tcp"
                     else:
                         # USB 摄像头也可设置缓冲区
                         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

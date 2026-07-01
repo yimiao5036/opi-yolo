@@ -329,7 +329,7 @@ class MissionManager:
     def _throttle_log_on_change(self, key, current_value, msg, *args,
                                  level=logging.INFO):
         """状态变化日志：仅当 current_value 与上次记录不同时输出一次"""
-        last = self._last_throttle_state.get(key, object())
+        last = self._last_throttle_state.get(key)
         if last != current_value:
             self._last_throttle_state[key] = current_value
             logger.log(level, msg, *args)
@@ -695,6 +695,7 @@ class MissionManager:
         if not target_detected:
             if self._target_lost_start is None:
                 self._target_lost_start = time.time()
+                lost_elapsed = 0.0
             else:
                 lost_elapsed = time.time() - self._target_lost_start
                 if lost_elapsed >= self.target_lost_timeout:
