@@ -356,7 +356,7 @@ class MissionManager:
             alt_rel = drone.get("alt_rel", 0.0)
             home = state.get("home", {})
 
-            self._throttle_log("init",5.0,"[INIT] mode=%s armed=%s alt_rel=%.1fm",mode, armed, alt_rel)
+            self._throttle_log("init_state",5.0,"[INIT] mode=%s armed=%s alt_rel=%.1fm",mode, armed, alt_rel)
 
             if not home.get("valid", False):
                 self._throttle_log("home_valid_init", 5.0,
