@@ -162,8 +162,10 @@ class VideoStreaming:
                     if self.is_rtsp:
                         # 设置 RTSP 缓冲区大小（只保留 1 帧，降低延迟）
                         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        self.cap.set(cv2.CAP_PROP_FOURCC,
-                                     cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        try:
+                            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        except Exception:
+                            pass  # 编码设置失败不影响连接
                         if "?" not in self.video_source:
                             self.video_source += "?tcp"
                     else:
