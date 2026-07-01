@@ -223,12 +223,13 @@ class VideoStreaming:
             pass
 
     def _udp_stream_sender_worker(self):
-        """ 原图传发送线程（增加帧统计日志） """
+        """ 原图传发送线程（异常降噪：首次报错后静默，恢复时输出日志） """
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_address = (self.gs_ip, self.udp_port)
         self.logger.info("图传后台线程已启动，目标地面站 -> %s:%s",
                          self.gs_ip, self.udp_port)
         send_count = 0
+        tx_error_reported = False   # 标记当前是否处于异常状态，避免刷屏
 
         while self.is_running:
             try:
@@ -244,13 +245,22 @@ class VideoStreaming:
                     self.logger.debug("图像数据过大 (%d bytes), 跳过发送", len(data))
                     continue
                 sock.sendto(data, server_address)
+
+                # ---- 发送成功：若之前处于异常状态，输出恢复日志 ----
+                if tx_error_reported:
+                    tx_error_reported = False
+                    self.logger.info("✅ 图传已恢复: %s:%s", self.gs_ip, self.udp_port)
+
                 send_count += 1
                 if send_count % 100 == 0:
                     self.logger.info("图传统计: 已发送 %d 帧 UDP 数据包", send_count)
+
             except queue.Empty:
                 continue
             except Exception as e:
-                self.logger.exception("图传线程异常: %s", e)
+                if not tx_error_reported:
+                    tx_error_reported = True
+                    self.logger.error("图传异常: %s (后续同类错误静默，恢复后输出日志)", e)
                 time.sleep(0.1)
         sock.close()
 

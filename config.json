@@ -32,6 +32,13 @@
         "enabled": true,
         "tcp_port": 9999
     },
+    "missions": {
+        "target_altitude": 3.0,
+        "arrival_radius": 0.3,
+        "hold_duration": 8.0,
+        "return_to_home": false,
+        "target_lost_timeout": null
+    },
     "log": {
     "enable_flight_log": true,
     "flight_log_interval": 20,

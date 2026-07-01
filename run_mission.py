@@ -119,13 +119,14 @@ class MissionOrchestrator:
 
         self.proxy.set_waypoints_callback(self._on_qgc_waypoints)
 
+        missions = cfg["missions"]
         self.mission = MissionManager(
             proxy=self.proxy,
             waypoints=self.waypoints,
-            target_altitude=3.0,
-            arrival_radius=0.3,
-            hold_duration=8.0,
-            return_to_home=False,
+            target_altitude=missions.get("target_altitude", 3.0),
+            arrival_radius=missions.get("arrival_radius", 0.3),
+            hold_duration=missions.get("hold_duration", 5.0),
+            return_to_home=missions.get("return_to_home", True),
         )
 
         # ================================================================
