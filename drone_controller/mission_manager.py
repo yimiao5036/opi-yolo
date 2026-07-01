@@ -97,6 +97,17 @@ class MissionManager:
         "OFFBOARD", "GUIDED", "AUTO", "HOLD", "LAND", "RTL",
     })
 
+    # ---- 解锁/起飞阶段允许的过渡模式 ----
+    TRANSITION_MODES = frozenset({
+        "MANUAL", "ALTCTL", "POSCTL", "AUTO", "HOLD",
+        "AUTO.READY", "AUTO.TAKEOFF", "AUTO.LOITER",
+    })
+
+    # ---- 起飞完成后可接受的悬停/保持模式 ----
+    TAKEOFF_HOLD_MODES = frozenset({
+        "HOLD", "AUTO", "AUTO.LOITER", "AUTO.TAKEOFF",
+    })
+
     # ---- 目标丢失超时（秒） ----
     DEFAULT_TARGET_LOST_TIMEOUT = 3.0
 
@@ -219,7 +230,7 @@ class MissionManager:
         if self.state not in (MissionState.INIT, MissionState.FINISHED):
             if state is not None:
                 mode = state["drone"].get("mode", "")
-                if mode not in self.AUTONOMOUS_MODES:
+                if not self._is_mode_allowed_for_state(mode, self.state):
                     logger.warning(
                         "\n⚠️ [Failsafe] 飞控模式被切为: %s！"
                         "人工接管，熔断任务！", mode
@@ -266,6 +277,28 @@ class MissionManager:
     # ================================================================
     #  辅助方法
     # ================================================================
+
+    def _is_autonomous_mode(self, mode):
+        """判断是否属于自主飞行模式，兼容 PX4 AUTO 子模式。"""
+        if mode in self.AUTONOMOUS_MODES:
+            return True
+        return isinstance(mode, str) and mode.startswith("AUTO.")
+
+    def _is_transition_mode(self, mode):
+        """解锁/起飞阶段允许的 PX4 过渡模式。"""
+        if mode in self.TRANSITION_MODES:
+            return True
+        return isinstance(mode, str) and mode.startswith("AUTO.")
+
+    def _is_mode_allowed_for_state(self, mode, state):
+        """按任务阶段判断当前飞控模式是否允许。"""
+        if state in (MissionState.ARMING, MissionState.TAKEOFF):
+            return self._is_transition_mode(mode)
+        return self._is_autonomous_mode(mode)
+
+    def _is_takeoff_hold_mode(self, mode):
+        """起飞高度到位后可接受的保持/悬停状态。"""
+        return mode in self.TAKEOFF_HOLD_MODES
 
     def _get_current_alt(self, state):
         """从 STATE 获取当前相对高度（正值向上）"""
@@ -431,7 +464,7 @@ class MissionManager:
 
             # ---- ① 等待 TAKEOFF 完成 ----
             reached_alt = alt_rel >= self.target_altitude * 0.9
-            in_hold = mode == "HOLD"
+            in_hold = self._is_takeoff_hold_mode(mode)
 
             if not (reached_alt and in_hold):
                 self._throttle_log("takeoff_wait", 3.0,
