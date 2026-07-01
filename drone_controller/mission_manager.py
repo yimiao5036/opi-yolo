@@ -1,9 +1,10 @@
 """
 mission_manager.py — 基于 ZeroMQ RouterProxy 的航点巡航状态机
 
-【重构背景】
-  系统底层架构已升级为 ZMQ Router 代理通信协议。本模块彻底摒弃
-  旧版 DroneController 直连方式，全面迁移至 RouterProxy。
+【协议变更 v2 — 2026-07】
+  SETPOINT 指令的 x/y 字段改为接收经纬度（lat/lon），z 字段接收
+  相对高度（正值向上）。航点存储格式从 NED (x, y, z) 切换为
+  经纬度 (lat, lon, alt)。
 
 【核心改动】
   1. self.drone → self.proxy（注入的 RouterProxy 实例）
@@ -13,10 +14,9 @@ mission_manager.py — 基于 ZeroMQ RouterProxy 的航点巡航状态机
   5. 新增 Failsafe 模式断流保护，退出 OFFBOARD 即熔断
   6. VISUAL_TRACKING 状态下完全让渡控制权，不发送任何 SETPOINT
 
-【位置估计】
-  Router 协议未暴露局部 NED 坐标，本模块使用速度积分
-  （vx × dt 累加）推算相对起飞点的水平位置，用于航点到
-  达判定。垂直轴直接使用 state["drone"]["alt_rel"]。
+【位置判定】
+  航点存储为经纬高 (lat, lon, alt)，使用 Haversine 公式计算
+  球面距离进行到达判定，不再依赖速度积分推算 NED 位置。
 
 【控制权协调】
   MissionManager 通过自有 proxy 发送指令。连续 20Hz SETPOINT
@@ -26,26 +26,27 @@ mission_manager.py — 基于 ZeroMQ RouterProxy 的航点巡航状态机
 """
 
 import time
-import math
 import logging
 from enum import Enum
+
+from utils.coord import haversine, dist_3d_latlon
 
 logger = logging.getLogger(__name__)
 
 
 class MissionState(Enum):
     """无人机任务状态枚举"""
-    WAITING_WAYPOINTS=-1  # 等待地面站下发航点
-    INIT = 0              # 初始化 / 等待连接
-    ARMING = 1            # 解锁中
-    TAKEOFF = 2           # 自动起飞中
-    NAVIGATING = 3        # 航点巡航导航
-    HOLD_TASK = 4         # 到达航点后的原地搜索 / 悬停
-    VISUAL_TRACKING = 5   # 🎯 视觉追踪中（控制权让渡给 UAVControlLoop）
-    RETURNING = 6         # 返航中
-    LANDING = 7           # 自动降落中
-    FINISHED = 8          # 任务结束 / 已上锁
-    HOLD_FINAL = 9        # 结束巡点后原地悬停（return_to_home=False）
+    WAITING_WAYPOINTS = -1  # 等待地面站下发航点
+    INIT = 0                # 初始化 / 等待连接
+    ARMING = 1              # 解锁中
+    TAKEOFF = 2             # 自动起飞中
+    NAVIGATING = 3          # 航点巡航导航
+    HOLD_TASK = 4           # 到达航点后的原地搜索 / 悬停
+    VISUAL_TRACKING = 5     # 🎯 视觉追踪中（控制权让渡给 UAVControlLoop）
+    RETURNING = 6           # 返航中
+    LANDING = 7             # 自动降落中
+    FINISHED = 8            # 任务结束 / 已上锁
+    HOLD_FINAL = 9          # 结束巡点后原地悬停（return_to_home=False）
 
 
 class FailsafeTriggered(Exception):
@@ -57,21 +58,12 @@ class FailsafeTriggered(Exception):
 
 
 # ================================================================
-#  内部工具
-# ================================================================
-
-def _dist_3d(x1, y1, z1, x2, y2, z2):
-    """三维欧氏距离"""
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2 + (z1 - z2) ** 2)
-
-
-# ================================================================
 #  航点巡航管理器
 # ================================================================
 
 class MissionManager:
     """
-    🛸 ZMQ 航点巡航状态机管理器
+    🛸 ZMQ 航点巡航状态机管理器（经纬度协议 v2）
 
     职责：
       - 封装完整的无人机任务生命周期（初始化 → 解锁 → 起飞 →
@@ -79,6 +71,16 @@ class MissionManager:
       - 所有底层通信通过注入的 RouterProxy 完成
       - 在 VISUAL_TRACKING 状态下让渡控制权给 UAVControlLoop
       - Failsafe 熔断保护
+
+    航点格式（经纬度协议 v2）：
+        {
+            "lat": 37.7749,        # 纬度（度）
+            "lon": -122.4194,      # 经度（度）
+            "alt": 1.5,            # 相对起飞点高度（米，正值向上）
+            "yaw": 0.0,            # 偏航角（度）
+            "command": "WAYPOINT", # TAKEOFF / LAND / WAYPOINT
+            "hold_duration": 8.0,  # 悬停搜索等待时长（秒）
+        }
 
     使用示例：
         proxy = RouterProxy()
@@ -95,9 +97,6 @@ class MissionManager:
         "OFFBOARD", "GUIDED", "AUTO", "HOLD", "LAND", "RTL",
     })
 
-    # ---- 位置估计：速度积分有效时间窗口 ----
-    MAX_POSITION_DT = 1.0
-
     # ---- 目标丢失超时（秒） ----
     DEFAULT_TARGET_LOST_TIMEOUT = 3.0
 
@@ -112,8 +111,8 @@ class MissionManager:
         """
         Args:
             proxy:               RouterProxy 实例（调用方负责 start/close）
-            waypoints:           航点列表 [{'x':1,'y':2,'z':-1.5,'yaw':0}, ...]
-            target_altitude:     默认起飞高度（米，正值=向上）
+            waypoints:           航点列表（经纬度格式 v2）
+            target_altitude:     默认起飞高度（米，正值向上）
             arrival_radius:      航点到达判定半径（米）
             hold_duration:       巡点无目标的最大悬停搜索时间（秒）
             return_to_home:      航点巡完后是否返航，False 则终点悬停
@@ -123,20 +122,19 @@ class MissionManager:
         self.proxy = proxy
 
         # ---- 任务参数 ----
-        # 航点列表（外部队列已经使用 NED 坐标系，Z 负值向上）
+        # 航点列表（经纬度协议 v2：[{lat, lon, alt, yaw, command}, ...]）
         self.waypoints = list(waypoints) if waypoints else []
-        #  根据是否有航点决定初始状态
+        # 根据是否有航点决定初始状态
         if self.waypoints:
-            # 有预置航点（如测试用硬编码），直接进入初始化
             self.state = MissionState.INIT
             self._waypoints_ready = True
             logger.info("MissionManager 初始化完成，已有 %d 个航点", len(self.waypoints))
         else:
-            # 无航点，进入等待状态（等待 QGC 下发）
             self.state = MissionState.WAITING_WAYPOINTS
             self._waypoints_ready = False
             logger.info("MissionManager 初始化完成，等待 QGC 下发航点...")
-        self.target_altitude = -abs(target_altitude)   # NED Z（负值向上）
+        # v2: 目标高度正值向上（原 NED 负值协议已废除）
+        self.target_altitude = abs(target_altitude)
         self.arrival_radius = arrival_radius
         self.hold_duration = hold_duration
         self.return_to_home = return_to_home
@@ -150,17 +148,9 @@ class MissionManager:
 
         # ---- 当前目标航点（共享给外部主循环 / UAVControlLoop） ----
         self.current_target = {
-            "x": 0.0, "y": 0.0,
-            "z": self.target_altitude, "yaw": 0.0,
+            "lat": 0.0, "lon": 0.0,
+            "alt": self.target_altitude, "yaw": 0.0,
         }
-
-        # ================================================================
-        #  本地位置估计（速度积分法）
-        # ================================================================
-        self._est_x = 0.0            # NED 北向（相对起飞点）
-        self._est_y = 0.0            # NED 东向
-        self._pos_time = 0.0         # 上次位置更新时间戳
-        self._home_set = False       # 首次 STATE 标记
 
         # ---- 计时器 ----
         self.hold_start_time = 0.0
@@ -171,20 +161,18 @@ class MissionManager:
         # ================================================================
         #  追踪完成信号（外部设置）
         # ================================================================
-        # UAVControlLoop 或 run_mission.py 在判定视觉追踪完成时置 True
         self.tracking_completed = False
-        # 追踪最大时长兜底
         self.tracking_max_duration = 10.0
 
         logger.info("MissionManager 初始化: %d 个航点, 目标高度=%.1fm, "
                      "到达半径=%.1fm, 搜寻时长=%.1fs, 返航=%s",
-                     len(self.waypoints), -self.target_altitude,
+                     len(self.waypoints), self.target_altitude,
                      self.arrival_radius, self.hold_duration,
                      self.return_to_home)
 
         # ---- 日志节流控制 ----
-        self._last_throttle_time = {}  # 节流日志: key → 上次打印时间戳
-        self._last_throttle_state = {}  # 状态缓存对比: key → 上次打印的值
+        self._last_throttle_time = {}
+        self._last_throttle_state = {}
 
     # ================================================================
     #  主入口
@@ -248,12 +236,7 @@ class MissionManager:
             return
 
         # ---------------------------------------------------------------
-        #  步骤 1：更新本地位置估计
-        # ---------------------------------------------------------------
-        self._update_local_position(state)
-
-        # ---------------------------------------------------------------
-        #  步骤 2：状态机分支
+        #  状态机分支（位置估计已移除 v2 — 使用经纬度距离计算）
         # ---------------------------------------------------------------
         try:
             if self.state == MissionState.INIT:
@@ -281,38 +264,13 @@ class MissionManager:
                          exc_info=True)
 
     # ================================================================
-    #  位置估计
+    #  辅助方法
     # ================================================================
 
-    def _update_local_position(self, state):
-        """通过速度积分更新本地 NED 位置估计"""
+    def _get_current_alt(self, state):
+        """从 STATE 获取当前相对高度（正值向上）"""
         try:
-            drone = state["drone"]
-            now = time.time()
-
-            if not self._home_set:
-                self._est_x = 0.0
-                self._est_y = 0.0
-                self._pos_time = now
-                self._home_set = True
-                logger.info("[位置] 初始位置记录完成")
-
-            dt = now - self._pos_time
-            if 0 < dt < self.MAX_POSITION_DT:
-                vx = drone.get("vx", 0.0)
-                vy = drone.get("vy", 0.0)
-                self._est_x += vx * dt
-                self._est_y += vy * dt
-            # dt ≥ MAX_POSITION_DT 时跳过积分防跳变
-
-            self._pos_time = now
-        except (KeyError, TypeError) as e:
-            logger.warning("[位置] 更新异常: %s", e)
-
-    def _get_current_z(self, state):
-        """从 STATE 获取当前 NED Z（负值向上）"""
-        try:
-            return -state["drone"].get("alt_rel", 0.0)
+            return state["drone"].get("alt_rel", 0.0)
         except (KeyError, TypeError):
             return self.target_altitude
 
@@ -356,7 +314,8 @@ class MissionManager:
             alt_rel = drone.get("alt_rel", 0.0)
             home = state.get("home", {})
 
-            self._throttle_log("init_state",5.0,"[INIT] mode=%s armed=%s alt_rel=%.1fm",mode, armed, alt_rel)
+            self._throttle_log("init_state", 5.0, "[INIT] mode=%s armed=%s alt_rel=%.1fm",
+                               mode, armed, alt_rel)
 
             if not home.get("valid", False):
                 self._throttle_log("home_valid_init", 5.0,
@@ -418,13 +377,12 @@ class MissionManager:
                 return
 
             # ---- 解锁成功 → 起飞 ----
-            takeoff_alt = -self.target_altitude   # 正值（协议 altitude 为正）
-            logger.info("\n[解锁成功] 发送起飞指令 (alt=%.1fm)", takeoff_alt)
+            logger.info("\n[解锁成功] 发送起飞指令 (alt=%.1fm)", self.target_altitude)
 
             ok, ack = self.proxy.send_waypoint(
                 lat=state["home"]["lat"],
                 lon=state["home"]["lon"],
-                alt=takeoff_alt,
+                alt=self.target_altitude,
                 alt_frame="RELATIVE",
                 speed=3.0, action="TAKEOFF",
                 yaw=state["drone"]["yaw"],
@@ -436,8 +394,10 @@ class MissionManager:
                 self._state_start_time = time.time()
             else:
                 logger.warning("[TAKEOFF] WAYPOINT 失败: %s，尝试 SETPOINT 爬升", ack)
+                drone = state.get("drone", {})
                 ok2, _ = self.proxy.send_setpoint(
-                    x=0, y=0, z=self.target_altitude, yaw=0.0,
+                    lat=drone.get("lat", 0.0), lon=drone.get("lon", 0.0),
+                    z=self.target_altitude, yaw=0.0,
                     control_mode="POSITION",
                 )
                 if ok2:
@@ -457,7 +417,7 @@ class MissionManager:
 
         流程（协议 §3.3.1）：
           ① 等待高度到达目标 90% 且 mode == "HOLD"
-          ② 发送预热 SETPOINT（当前位置悬停）
+          ② 发送预热 SETPOINT（当前位置经纬度悬停）
           ③ time.sleep(0.2) 等待流建立
           ④ 发送 COMMAND("OFFBOARD")
           ⑤ 轮询等待 mode == "OFFBOARD"
@@ -465,20 +425,18 @@ class MissionManager:
         """
         try:
             drone = state["drone"]
+            home = state.get("home", {})
             alt_rel = drone.get("alt_rel", 0.0)
             mode = drone.get("mode", "")
-            target_up = -self.target_altitude  # 正值
 
             # ---- ① 等待 TAKEOFF 完成 ----
-            # 协议要求：高度到达目标 90% 且模式为 HOLD
-            reached_alt = alt_rel >= target_up * 0.9
+            reached_alt = alt_rel >= self.target_altitude * 0.9
             in_hold = mode == "HOLD"
 
             if not (reached_alt and in_hold):
-                # 节流输出等待状态
                 self._throttle_log("takeoff_wait", 3.0,
                                    "[起飞中] alt=%.1f/%.1f mode=%s 耗时=%.1fs",
-                                   alt_rel, target_up, mode,
+                                   alt_rel, self.target_altitude, mode,
                                    time.time() - self._state_start_time)
                 return
 
@@ -486,9 +444,10 @@ class MissionManager:
             logger.info("[TAKEOFF] 高度 %.1fm，模式 %s，准备切换 OFFBOARD...",
                         alt_rel, mode)
 
-            # 先预热悬停（协议 §3.3.1 ③→④）
+            # 发送预热 SETPOINT（v2: x=经度, y=纬度, z=相对高度）
             self.proxy.send_setpoint(
-                x=0, y=0, z=-alt_rel, yaw=0.0,
+                lat=drone.get("lat", 0.0), lon=drone.get("lon", 0.0),
+                z=alt_rel, yaw=0.0,
                 control_mode="POSITION",
             )
             time.sleep(0.2)
@@ -497,7 +456,6 @@ class MissionManager:
             ok, ack = self.proxy.send_command("OFFBOARD")
             if not ok:
                 logger.error("[TAKEOFF] OFFBOARD 指令失败: %s", ack)
-                # 超时后强行进入巡航（降级）
                 if time.time() - self._state_start_time > self.TAKEOFF_TIMEOUT:
                     logger.warning("[TAKEOFF] 超时，强行进入巡航")
                     self.state = MissionState.NAVIGATING
@@ -516,7 +474,6 @@ class MissionManager:
                     return
                 time.sleep(0.1)
 
-            # 超时
             logger.warning("[TAKEOFF] OFFBOARD 切换超时，强行进入巡航")
             self.state = MissionState.NAVIGATING
             self.current_wp_index = 0
@@ -531,57 +488,52 @@ class MissionManager:
         """
         [NAVIGATING] 每帧发送 POSITION SETPOINT 前往当前航点
 
-        到达判定后推进索引；所有航点飞完后根据 return_to_home
-        决定返航或悬停。
+        v2: send_setpoint(x=lat, y=lon, z=alt)，到达判定使用 Haversine 距离。
+        到达判定后推进索引；所有航点飞完后根据 return_to_home 决定返航或悬停。
         """
         if not self.waypoints or self.current_wp_index >= len(self.waypoints):
-            self._finish_navigation()
+            self._finish_navigation(state)
             return
 
         wp = self.waypoints[self.current_wp_index]
         cmd = wp.get("command", "WAYPOINT")
 
-        # 特殊航点分支选择
-        # 起飞航点
+        # ---- 起飞航点 ----
         if cmd == "TAKEOFF":
-            # 飞到原点 + 目标高度
-            self.proxy.send_setpoint(
-                x=0, y=0, z=wp.get("z", self.target_altitude),
-                yaw=wp.get("yaw", 0.0),control_mode="POSITION",
-            )
-            current_z = self._get_current_z(state)
-            target_z = wp.get("z", self.target_altitude)
-            if abs(current_z - target_z) < 0.5:
-                self.current_wp_index += 1
+            # 起飞已完成，直接推进到下一个航点
+            self.current_wp_index += 1
             return
 
-        # 降落航点
+        # ---- 降落航点 ----
         if cmd == "LAND":
             logger.info("🛬 执行降落")
             self.proxy.send_command("LAND")
             self.state = MissionState.LANDING
             return
 
-
-        wp_x = wp["x"]
-        wp_y = wp["y"]
-        wp_z = wp.get("z", self.target_altitude)
+        # ---- 普通航点 ----
+        wp_lat = wp["lat"]
+        wp_lon = wp["lon"]
+        wp_alt = wp.get("alt", self.target_altitude)
         wp_yaw = wp.get("yaw", 0.0)
 
-        # ---- 发送 POSITION SETPOINT（通过自有 proxy） ----
-        # 此 SETPOINT 让 PX4 飞向目标航点
+        # v2: 发送 POSITION SETPOINT（经纬度 + 高度）
         self.proxy.send_setpoint(
-            x=wp_x, y=wp_y, z=wp_z, yaw=wp_yaw,
+            lat=wp_lat, lon=wp_lon, z=wp_alt, yaw=wp_yaw,
             control_mode="POSITION",
         )
 
         # ---- 共享目标 ----
-        self.current_target = {"x": wp_x, "y": wp_y, "z": wp_z, "yaw": wp_yaw}
+        self.current_target = {"lat": wp_lat, "lon": wp_lon,
+                               "alt": wp_alt, "yaw": wp_yaw}
 
-        # ---- 到达判定 ----
-        current_z = self._get_current_z(state)
-        dist = _dist_3d(self._est_x, self._est_y, current_z,
-                        wp_x, wp_y, wp_z)
+        # ---- 到达判定（Haversine 球面距离） ----
+        drone = state["drone"]
+        drone_lat = drone.get("lat", 0.0)
+        drone_lon = drone.get("lon", 0.0)
+        current_alt = self._get_current_alt(state)
+        dist = dist_3d_latlon(drone_lat, drone_lon, current_alt,
+                              wp_lat, wp_lon, wp_alt)
 
         if dist < self.arrival_radius:
             logger.info("\n✅ [到达航点 %d/%d] dist=%.2fm",
@@ -589,19 +541,25 @@ class MissionManager:
             self.state = MissionState.HOLD_TASK
             self.hold_start_time = time.time()
         else:
-            # 节流：每 5 秒输出一次巡航进度，不刷屏
             self._throttle_log("navigating", 5.0,
                                "[巡航中] 航点 [%d/%d] 距离=%.2fm",
                                self.current_wp_index + 1,
                                len(self.waypoints), dist)
 
-    def _finish_navigation(self):
+    def _finish_navigation(self, state):
         """所有航点飞完后的跳转"""
+        home = state.get("home", {}) if state else {}
+        home_lat = home.get("lat", 0.0)
+        home_lon = home.get("lon", 0.0)
+
         if self.return_to_home:
-            logger.info("\n[巡航完成] 返回起始点...")
+            logger.info("\n[巡航完成] 返回起始点 (lat=%.6f lon=%.6f)...",
+                        home_lat, home_lon)
             self.state = MissionState.RETURNING
-            self.current_target = {"x": 0, "y": 0,
-                                   "z": self.target_altitude, "yaw": 0}
+            self.current_target = {
+                "lat": home_lat, "lon": home_lon,
+                "alt": self.target_altitude, "yaw": 0,
+            }
         else:
             logger.info("\n[巡航完成] 末端悬停...")
             self.state = MissionState.HOLD_FINAL
@@ -627,17 +585,17 @@ class MissionManager:
             self.tracking_completed = False
             return
 
-        # ---- 保持当前位置悬停 ----
+        # ---- 保持当前位置悬停（v2: x=lat, y=lon, z=alt） ----
         wp = self.waypoints[self.current_wp_index]
         self.proxy.send_setpoint(
-            x=wp["x"], y=wp["y"],
-            z=wp.get("z", self.target_altitude),
+            lat=wp["lat"], lon=wp["lon"],
+            z=wp.get("alt", self.target_altitude),
             yaw=wp.get("yaw", 0),
             control_mode="POSITION",
         )
         self.current_target = {
-            "x": wp["x"], "y": wp["y"],
-            "z": wp.get("z", self.target_altitude),
+            "lat": wp["lat"], "lon": wp["lon"],
+            "alt": wp.get("alt", self.target_altitude),
             "yaw": wp.get("yaw", 0),
         }
 
@@ -649,7 +607,6 @@ class MissionManager:
             self.current_wp_index += 1
             self.state = MissionState.NAVIGATING
         else:
-            # 静默悬停检索，不刷屏；仅每 3 秒轻量心跳
             self._throttle_log("hold_task", 3.0,
                                "[检索中] 航点 %d 剩余 %.1fs",
                                self.current_wp_index + 1,
@@ -661,20 +618,15 @@ class MissionManager:
         """
         [VISUAL_TRACKING] 🎯 完全让渡控制权给 UAVControlLoop
 
-        【核心设计】
-          MissionManager 在此状态下 **不发送任何 SETPOINT**。
-          UAVControlLoop (20Hz 独立线程) 通过其自有 proxy 发送
-          VELOCITY SETPOINT 进行视觉闭环追踪。
+        MissionManager 在此状态下 **不发送任何 SETPOINT**。
+        UAVControlLoop (20Hz 独立线程) 通过其自有 proxy 发送
+        VELOCITY SETPOINT 进行视觉闭环追踪。
 
-          本模块仅负责追踪退出条件的判定和状态切换。
-
-        【退出条件】
+        退出条件：
           1. self.tracking_completed == True（外部模块设置）
           2. 目标丢失超过 target_lost_timeout 秒
           3. 追踪总时长超过 tracking_max_duration（兜底）
         """
-        # ---- 不发送任何 SETPOINT — 控制权已让渡 ----
-
         tracking_elapsed = time.time() - self.tracking_start_time
 
         # ---- 兜底超时 ----
@@ -703,20 +655,17 @@ class MissionManager:
                                 lost_elapsed)
                     self._exit_tracking()
                     return
-            # 节流：每 2 秒输出一次丢失状态（不刷屏）
             self._throttle_log("track_lost", 2.0,
                                "[追踪中] 丢失 %.1fs/%.1fs",
                                lost_elapsed if self._target_lost_start
                                else 0.0,
                                self.target_lost_timeout)
         else:
-            # 目标重新出现时，单次日志（事件驱动）
             self._throttle_log_on_change("track_lost_clear",
                                          self._target_lost_start is not None,
                                          "[追踪中] 目标恢复")
             self._target_lost_start = None
 
-        # 节流：每 5 秒输出一次追踪心跳，20Hz 静默
         self._throttle_log("track_heartbeat", 5.0,
                            "[追踪中] 进行中... %.1fs", tracking_elapsed)
 
@@ -732,19 +681,33 @@ class MissionManager:
 
     def _handle_returning(self, state):
         """
-        [RETURNING] 发送 POSITION SETPOINT 到起始点 (0,0,z)
+        [RETURNING] 发送 POSITION SETPOINT 到 HOME 点
+
+        v2: send_setpoint(x=home_lat, y=home_lon, z=target_alt)
+        到达判定使用 Haversine 球面距离。
         """
+        home = state.get("home", {})
+        drone = state.get("drone", {})
+        home_lat = home.get("lat", 0.0)
+        home_lon = home.get("lon", 0.0)
+
+        # v2: x=纬度, y=经度, z=相对高度
         self.proxy.send_setpoint(
-            x=0, y=0, z=self.target_altitude, yaw=0,
+            lat=home_lat, lon=home_lon, z=self.target_altitude, yaw=0,
             control_mode="POSITION",
         )
-        self.current_target = {"x": 0, "y": 0,
-                               "z": self.target_altitude, "yaw": 0}
+        self.current_target = {
+            "lat": home_lat, "lon": home_lon,
+            "alt": self.target_altitude, "yaw": 0,
+        }
 
-        current_z = self._get_current_z(state)
-        dist = _dist_3d(self._est_x, self._est_y, current_z,
-                        0.0, 0.0, self.target_altitude)
-        # 节流：每 3 秒输出一次返航距离，不刷屏
+        # ---- Haversine 距离到达判定 ----
+        current_alt = self._get_current_alt(state)
+        drone_lat = drone.get("lat", 0.0)
+        drone_lon = drone.get("lon", 0.0)
+        dist = dist_3d_latlon(drone_lat, drone_lon, current_alt,
+                              home_lat, home_lon, self.target_altitude)
+
         self._throttle_log("returning", 3.0,
                            "[返航中] 距离=%.2fm", dist)
 
@@ -759,13 +722,10 @@ class MissionManager:
     # ---- 降落 ----
 
     def _handle_landing(self, state):
-        """
-        [LANDING] 监控 disarm 状态判断着陆
-        """
+        """[LANDING] 监控 disarm 状态判断着陆"""
         try:
             armed = state["drone"].get("armed", False)
             alt_rel = state["drone"].get("alt_rel", 0.0)
-            # 节流：每 3 秒输出一次高度，不刷屏
             self._throttle_log("landing", 3.0,
                                "[降落中] 高度=%.1fm 已解锁=%s",
                                alt_rel, not armed)
@@ -781,29 +741,30 @@ class MissionManager:
     def _handle_hold_final(self, state):
         """
         [HOLD_FINAL] 末端悬停，保持最终航点位置
+
+        v2: x=lat, y=lon, z=alt
         """
         if self.waypoints:
             final_wp = self.waypoints[-1]
         else:
-            final_wp = {"x": 0, "y": 0,
-                        "z": self.target_altitude, "yaw": 0}
+            final_wp = {"lat": 0.0, "lon": 0.0,
+                        "alt": self.target_altitude, "yaw": 0}
 
         self.proxy.send_setpoint(
-            x=final_wp["x"], y=final_wp["y"],
-            z=final_wp.get("z", self.target_altitude),
+            lat=final_wp["lat"], lon=final_wp["lon"],
+            z=final_wp.get("alt", self.target_altitude),
             yaw=final_wp.get("yaw", 0),
             control_mode="POSITION",
         )
         self.current_target = {
-            "x": final_wp["x"], "y": final_wp["y"],
-            "z": final_wp.get("z", self.target_altitude),
+            "lat": final_wp["lat"], "lon": final_wp["lon"],
+            "alt": final_wp.get("alt", self.target_altitude),
             "yaw": final_wp.get("yaw", 0),
         }
-        # 节流：每 10 秒输出一次末端悬停状态，不刷屏
         self._throttle_log("hold_final", 10.0,
-                           "[挂起] 保持 (%.1f, %.1f, %.1f) 等待接管",
-                           final_wp["x"], final_wp["y"],
-                           final_wp.get("z", self.target_altitude))
+                           "[挂起] 保持 (%.6f, %.6f, %.1f) 等待接管",
+                           final_wp["lat"], final_wp["lon"],
+                           final_wp.get("alt", self.target_altitude))
 
     # ================================================================
     #  辅助
@@ -814,49 +775,31 @@ class MissionManager:
         if self.waypoints and index < len(self.waypoints):
             wp = self.waypoints[index]
             self.current_target = {
-                "x": wp["x"], "y": wp["y"],
-                "z": wp.get("z", self.target_altitude),
+                "lat": wp["lat"], "lon": wp["lon"],
+                "alt": wp.get("alt", self.target_altitude),
                 "yaw": wp.get("yaw", 0),
             }
 
-
     def set_waypoints(self, waypoints):
-        """由外部调用，动态注入/更新航点列表"""
+        """由外部调用，动态注入/更新航点列表（经纬度格式 v2）"""
         self.waypoints = list(waypoints)
         self.current_wp_index = 0
-        self._waypoints_ready = True  # 这个标志位结合 WAITING_WAYPOINTS 状态使用
+        self._waypoints_ready = True
         logger.info("MissionManager 航点已更新，共 %d 个", len(waypoints))
-
 
     # ================================================================
     #  🚨 紧急停靠（外部调用）
     # ================================================================
 
     def emergency_stop(self):
-        """
-        外部触发的紧急降落入口（可在任何状态下调用）
-
-        行为：
-          1. 发送 LAND 指令到飞控
-          2. 将状态机切换到 LANDING 状态
-          3. 记录警告日志（供事后分析）
-
-        注意：
-          - 此方法可在任何线程中调用（内部使用 proxy，proxy 本身是线程安全的）
-          - 调用后，主循环会检测到 state == LANDING 并执行降落逻辑
-          - 如果已经在 LANDING 状态，重复调用只会重新发送 LAND 指令
-        """
+        """外部触发的紧急降落入口（可在任何状态下调用）"""
         logger.warning("🚨 [emergency_stop] 紧急降落触发！")
 
-        # 1. 发送 LAND 指令（不管当前状态如何，直接发）
         ok, ack = self.proxy.send_command("LAND")
         if ok:
             logger.info("✅ LAND 指令已发送")
         else:
             logger.error(f"❌ LAND 指令发送失败: {ack}")
 
-        # 2. 状态机强制切换到 LANDING（让主循环接管后续降落逻辑）
         self.state = MissionState.LANDING
-
-        # 3. 重置一些计时器，让降落逻辑从当前状态开始
         self._state_start_time = time.time()
