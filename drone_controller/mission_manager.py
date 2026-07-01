@@ -30,8 +30,6 @@ import math
 import logging
 from enum import Enum
 
-from sympy import true
-
 logger = logging.getLogger(__name__)
 
 
@@ -677,7 +675,6 @@ class MissionManager:
         """
         # ---- 不发送任何 SETPOINT — 控制权已让渡 ----
 
-        global lost_elapsed
         tracking_elapsed = time.time() - self.tracking_start_time
 
         # ---- 兜底超时 ----
