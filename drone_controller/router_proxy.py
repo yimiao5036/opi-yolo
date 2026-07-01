@@ -173,7 +173,8 @@ class RouterProxy:
 
         位置控制:
             proxy.send_setpoint(control_mode="POSITION",
-                                lat=22.543210, lon=113.887650, z=-8.0, yaw=0.0)
+                                x=1.0, y=0.0, z=-0.5, yaw=0.0,
+                                frame="LOCAL_OFFSET_NED")
         速度控制:
             proxy.send_setpoint(control_mode="VELOCITY",
                                 vx=1.0, vy=0.0, vz=0.0, yaw_rate=0.0)

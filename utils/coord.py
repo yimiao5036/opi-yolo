@@ -33,6 +33,29 @@ def latlon_to_ned(lat, lon, alt, ref_lat, ref_lon, ref_alt):
     return x, y, z
 
 
+def latlon_alt_to_local_offset(target_lat, target_lon, target_alt,
+                               current_lat, current_lon, current_alt):
+    """
+    将目标经纬高转换为相对当前位置的 LOCAL_OFFSET_NED 偏移量。
+
+    Args:
+        target_lat, target_lon: 目标纬度/经度（度）
+        target_alt:             目标相对高度（米，正值向上）
+        current_lat, current_lon: 当前纬度/经度（度）
+        current_alt:              当前相对高度（米，正值向上）
+
+    Returns:
+        (x, y, z): 相对当前位置的 NED 偏移（米）
+            x: 北向偏移，正值向北
+            y: 东向偏移，正值向东
+            z: 下向偏移，正值下降，负值爬升
+    """
+    return latlon_to_ned(
+        target_lat, target_lon, target_alt,
+        current_lat, current_lon, current_alt,
+    )
+
+
 def haversine(lat1, lon1, lat2, lon2):
     """
     使用 Haversine 公式计算两个经纬度点之间的球面距离（米）

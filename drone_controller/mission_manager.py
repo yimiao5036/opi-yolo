@@ -2,9 +2,9 @@
 mission_manager.py — 基于 ZeroMQ RouterProxy 的航点巡航状态机
 
 【协议变更 v2 — 2026-07】
-  SETPOINT 指令的 x/y 字段改为接收经纬度（lat/lon），z 字段接收
-  相对高度（正值向上）。航点存储格式从 NED (x, y, z) 切换为
-  经纬度 (lat, lon, alt)。
+  航点存储格式使用经纬度 (lat, lon, alt)。发送 POSITION SETPOINT
+  时在本模块内转换为相对当前位置的 LOCAL_OFFSET_NED 偏移
+  (x=北向, y=东向, z=向下)。
 
 【核心改动】
   1. self.drone → self.proxy（注入的 RouterProxy 实例）
@@ -29,7 +29,7 @@ import time
 import logging
 from enum import Enum
 
-from utils.coord import haversine, dist_3d_latlon
+from utils.coord import haversine, dist_3d_latlon, latlon_alt_to_local_offset
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ class FailsafeTriggered(Exception):
 
 class MissionManager:
     """
-    🛸 ZMQ 航点巡航状态机管理器（经纬度协议 v2）
+    🛸 ZMQ 航点巡航状态机管理器（经纬度航点 + 相对位置 SETPOINT）
 
     职责：
       - 封装完整的无人机任务生命周期（初始化 → 解锁 → 起飞 →
@@ -395,10 +395,10 @@ class MissionManager:
             else:
                 logger.warning("[TAKEOFF] WAYPOINT 失败: %s，尝试 SETPOINT 爬升", ack)
                 drone = state.get("drone", {})
-                ok2, _ = self.proxy.send_setpoint(
-                    lat=drone.get("lat", 0.0), lon=drone.get("lon", 0.0),
-                    z=self.target_altitude, yaw=0.0,
-                    control_mode="POSITION",
+                ok2, _ = self._send_relative_position_setpoint(
+                    state,
+                    drone.get("lat", 0.0), drone.get("lon", 0.0),
+                    self.target_altitude, yaw=0.0,
                 )
                 if ok2:
                     self.state = MissionState.TAKEOFF
@@ -417,7 +417,7 @@ class MissionManager:
 
         流程（协议 §3.3.1）：
           ① 等待高度到达目标 90% 且 mode == "HOLD"
-          ② 发送预热 SETPOINT（当前位置经纬度悬停）
+          ② 发送预热 SETPOINT（相对当前位置悬停）
           ③ time.sleep(0.2) 等待流建立
           ④ 发送 COMMAND("OFFBOARD")
           ⑤ 轮询等待 mode == "OFFBOARD"
@@ -444,11 +444,11 @@ class MissionManager:
             logger.info("[TAKEOFF] 高度 %.1fm，模式 %s，准备切换 OFFBOARD...",
                         alt_rel, mode)
 
-            # 发送预热 SETPOINT（v2: x=经度, y=纬度, z=相对高度）
-            self.proxy.send_setpoint(
-                lat=drone.get("lat", 0.0), lon=drone.get("lon", 0.0),
-                z=alt_rel, yaw=0.0,
-                control_mode="POSITION",
+            # 发送预热 SETPOINT（相对当前位置悬停）
+            self._send_relative_position_setpoint(
+                state,
+                drone.get("lat", 0.0), drone.get("lon", 0.0),
+                alt_rel, yaw=0.0,
             )
             time.sleep(0.2)
 
@@ -488,7 +488,7 @@ class MissionManager:
         """
         [NAVIGATING] 每帧发送 POSITION SETPOINT 前往当前航点
 
-        v2: send_setpoint(x=lat, y=lon, z=alt)，到达判定使用 Haversine 距离。
+        POSITION SETPOINT 发送 LOCAL_OFFSET_NED 相对偏移；到达判定使用 Haversine 距离。
         到达判定后推进索引；所有航点飞完后根据 return_to_home 决定返航或悬停。
         """
         if not self.waypoints or self.current_wp_index >= len(self.waypoints):
@@ -517,10 +517,9 @@ class MissionManager:
         wp_alt = wp.get("alt", self.target_altitude)
         wp_yaw = wp.get("yaw", 0.0)
 
-        # v2: 发送 POSITION SETPOINT（经纬度 + 高度）
-        self.proxy.send_setpoint(
-            lat=wp_lat, lon=wp_lon, z=wp_alt, yaw=wp_yaw,
-            control_mode="POSITION",
+        # 发送 POSITION SETPOINT（相对当前位置 LOCAL_OFFSET_NED）
+        self._send_relative_position_setpoint(
+            state, wp_lat, wp_lon, wp_alt, yaw=wp_yaw,
         )
 
         # ---- 共享目标 ----
@@ -585,13 +584,12 @@ class MissionManager:
             self.tracking_completed = False
             return
 
-        # ---- 保持当前位置悬停（v2: x=lat, y=lon, z=alt） ----
+        # ---- 保持当前位置悬停（相对当前位置 LOCAL_OFFSET_NED） ----
         wp = self.waypoints[self.current_wp_index]
-        self.proxy.send_setpoint(
-            lat=wp["lat"], lon=wp["lon"],
-            z=wp.get("alt", self.target_altitude),
+        self._send_relative_position_setpoint(
+            state,
+            wp["lat"], wp["lon"], wp.get("alt", self.target_altitude),
             yaw=wp.get("yaw", 0),
-            control_mode="POSITION",
         )
         self.current_target = {
             "lat": wp["lat"], "lon": wp["lon"],
@@ -683,7 +681,7 @@ class MissionManager:
         """
         [RETURNING] 发送 POSITION SETPOINT 到 HOME 点
 
-        v2: send_setpoint(x=home_lat, y=home_lon, z=target_alt)
+        POSITION SETPOINT 发送到 HOME 的 LOCAL_OFFSET_NED 相对偏移；
         到达判定使用 Haversine 球面距离。
         """
         home = state.get("home", {})
@@ -691,10 +689,9 @@ class MissionManager:
         home_lat = home.get("lat", 0.0)
         home_lon = home.get("lon", 0.0)
 
-        # v2: x=纬度, y=经度, z=相对高度
-        self.proxy.send_setpoint(
-            lat=home_lat, lon=home_lon, z=self.target_altitude, yaw=0,
-            control_mode="POSITION",
+        # 发送 POSITION SETPOINT（相对当前位置 LOCAL_OFFSET_NED）
+        self._send_relative_position_setpoint(
+            state, home_lat, home_lon, self.target_altitude, yaw=0,
         )
         self.current_target = {
             "lat": home_lat, "lon": home_lon,
@@ -742,7 +739,7 @@ class MissionManager:
         """
         [HOLD_FINAL] 末端悬停，保持最终航点位置
 
-        v2: x=lat, y=lon, z=alt
+        POSITION SETPOINT 发送 LOCAL_OFFSET_NED 相对偏移。
         """
         if self.waypoints:
             final_wp = self.waypoints[-1]
@@ -750,11 +747,11 @@ class MissionManager:
             final_wp = {"lat": 0.0, "lon": 0.0,
                         "alt": self.target_altitude, "yaw": 0}
 
-        self.proxy.send_setpoint(
-            lat=final_wp["lat"], lon=final_wp["lon"],
-            z=final_wp.get("alt", self.target_altitude),
+        self._send_relative_position_setpoint(
+            state,
+            final_wp["lat"], final_wp["lon"],
+            final_wp.get("alt", self.target_altitude),
             yaw=final_wp.get("yaw", 0),
-            control_mode="POSITION",
         )
         self.current_target = {
             "lat": final_wp["lat"], "lon": final_wp["lon"],
@@ -769,6 +766,25 @@ class MissionManager:
     # ================================================================
     #  辅助
     # ================================================================
+
+    def _send_relative_position_setpoint(self, state, target_lat, target_lon,
+                                         target_alt, yaw=0.0):
+        """按相对当前位置的 LOCAL_OFFSET_NED 发送 POSITION SETPOINT。"""
+        drone = state.get("drone", {}) if state else {}
+        current_lat = drone.get("lat", 0.0)
+        current_lon = drone.get("lon", 0.0)
+        current_alt = self._get_current_alt(state)
+
+        x, y, z = latlon_alt_to_local_offset(
+            target_lat, target_lon, target_alt,
+            current_lat, current_lon, current_alt,
+        )
+
+        return self.proxy.send_setpoint(
+            x=x, y=y, z=z, yaw=yaw,
+            frame="LOCAL_OFFSET_NED",
+            control_mode="POSITION",
+        )
 
     def _set_current_target_from_wp(self, index):
         """从航点列表更新 current_target"""
