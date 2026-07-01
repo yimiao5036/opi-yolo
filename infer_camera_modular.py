@@ -64,11 +64,10 @@ class VideoStreaming:
         """ 后台不断读取帧，存入 frame_buffer """
         while self.is_running:
             # 如果摄像头未打开或已断开，尝试连接
+            # _open_camera() 内部自带带退避的无限重试，阻塞直到成功或被停止
             if self.cap is None or not self.cap.isOpened():
                 self._open_camera()
-                if self.cap is None or not self.cap.isOpened():
-                    time.sleep(1)   # 等待重连
-                    continue
+                continue    # 回到 while 头部检查 is_running 并读取帧
 
             ret, frame = self.cap.read()
             if not ret:
@@ -93,40 +92,116 @@ class VideoStreaming:
         if self.cap is not None:
             self.cap.release()
 
+    @staticmethod
+    def _interruptible_sleep(duration, interval=1.0):
+        """
+        分段睡眠，每 interval 秒检查一次线程退出条件。
+        替代 time.sleep(duration)，确保能秒级响应停止信号。
+
+        Args:
+            duration:  总睡眠时间（秒）
+            interval:  每段睡眠时长（秒），默认 1 秒
+        """
+        end_time = time.time() + duration
+        while time.time() < end_time:
+            remaining = min(interval, end_time - time.time())
+            if remaining <= 0:
+                break
+            time.sleep(remaining)
+
     def _open_camera(self):
-        """ 打开摄像头或 RTSP 流，并设置低延迟参数 """
-        try:
-            self.logger.info("正在连接视频源: %s", self.video_source)
-            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
-            self.cap = cv2.VideoCapture(self.video_source, cv2.CAP_FFMPEG)
+        """
+        打开摄像头或 RTSP 流，带自动退避重试机制
 
-            if self.is_rtsp:
-                # 设置 RTSP 缓冲区大小（只保留 1 帧，降低延迟）
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                # 设置读取超时（OpenCV 没有直接超时参数，但可尝试设置后端属性）
-                # 某些平台支持以下设置：
-                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('H', '2', '6', '4'))
-                # 强制使用 tcp 协议（某些 rtsp 默认 udp 会丢包严重）
-                # 如果 rtsp 地址支持，可以改成 "rtsp://...?tcp"
-                if "?" not in self.video_source:
-                    self.video_source += "?tcp"
-                    # 注意：有些相机需要重新初始化，这里简单打印提示
-                    self.logger.info("建议使用 TCP 传输: 在 RTSP URL 后添加 ?tcp")
-            else:
-                # USB 摄像头也可设置缓冲区
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        【重试策略】
+          1. 首轮正常尝试（INFO 日志，不打印 Warn）
+          2. 每轮最多 5 次重试，每次间隔 1 秒，释放旧资源后再试
+          3. 5 次全部失败 → 进入 30 秒冷却期（分段 sleep，可秒级响应停止信号）
+          4. 无限外层 while self.is_running 循环
+             → 硬件恢复后自动重连，手动停止时立即退出
 
-            # 可选：强制指定分辨率（根据你的相机调整）
-            # self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            # self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        【日志规范】
+          - 首次成功打开         → INFO
+          - 每轮重试开始         → WARN（标明轮次）
+          - 每次重试失败         → WARN（标明第几次/共5次）
+          - 进入 30 秒冷却期     → ERROR
+          - 重连成功后           → INFO（带 ✅ 标记）
+        """
+        RETRIES_PER_ROUND = 5
+        RETRY_INTERVAL = 1.0      # 小循环重试间隔（秒）
+        COOLDOWN = 30.0           # 大循环冷却期（秒）
 
-            if self.cap.isOpened():
-                self.logger.info("视频源连接成功: %s", self.video_source)
-            else:
-                self.logger.error("视频源打开失败: %s", self.video_source)
-        except Exception as e:
-            self.logger.error("打开视频源异常: %s", e)
-            self.cap = None
+        first_attempt = True       # 首轮特殊处理：不打印 Warn
+        round_num = 0
+
+        while self.is_running:
+            round_num += 1
+
+            if not first_attempt:
+                self.logger.warning("摄像头重连第 %d 轮开始（共 %d 次尝试）...",
+                                    round_num, RETRIES_PER_ROUND)
+
+            for attempt in range(1, RETRIES_PER_ROUND + 1):
+                if not self.is_running:
+                    return
+
+                # ---- 每次重试前释放旧资源，防止描述符泄漏 ----
+                if self.cap is not None:
+                    try:
+                        self.cap.release()
+                    except Exception:
+                        pass
+                    self.cap = None
+
+                try:
+                    self.logger.info("正在连接视频源: %s (尝试 %d/%d)",
+                                     self.video_source, attempt, RETRIES_PER_ROUND)
+                    os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+                    self.cap = cv2.VideoCapture(self.video_source, cv2.CAP_FFMPEG)
+
+                    if self.is_rtsp:
+                        # 设置 RTSP 缓冲区大小（只保留 1 帧，降低延迟）
+                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                        self.cap.set(cv2.CAP_PROP_FOURCC,
+                                     cv2.VideoWriter_fourcc('H', '2', '6', '4'))
+                        if "?" not in self.video_source:
+                            self.video_source += "?tcp"
+                    else:
+                        # USB 摄像头也可设置缓冲区
+                        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+                    if self.cap.isOpened():
+                        if first_attempt:
+                            self.logger.info("视频源连接成功: %s", self.video_source)
+                        else:
+                            self.logger.info("✅ 摄像头重连成功: %s", self.video_source)
+                        return   # 成功！退出 _open_camera
+                    else:
+                        self.cap.release()
+                        self.cap = None
+                        self.logger.warning("摄像头打开失败 (尝试 %d/%d)",
+                                            attempt, RETRIES_PER_ROUND)
+
+                except Exception as e:
+                    if self.cap is not None:
+                        try:
+                            self.cap.release()
+                        except Exception:
+                            pass
+                        self.cap = None
+                    self.logger.warning("摄像头打开异常: %s (尝试 %d/%d)",
+                                        e, attempt, RETRIES_PER_ROUND)
+
+                # 小循环内重试间隔（分段 sleep，可响应停止信号）
+                if attempt < RETRIES_PER_ROUND and self.is_running:
+                    self._interruptible_sleep(RETRY_INTERVAL)
+
+            first_attempt = False
+
+            # ---- 5 次全部失败 → 进入冷却期 ----
+            if self.is_running:
+                self.logger.error("摄像头打开失败，进入 %.0f 秒冷却期...", COOLDOWN)
+                self._interruptible_sleep(COOLDOWN)
 
     def read_frame(self):
         """ 主循环调用：从缓冲区获取最新一帧（非阻塞） """
