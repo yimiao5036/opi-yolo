@@ -453,76 +453,74 @@ class MissionManager:
 
     def _handle_takeoff(self, state):
         """
-        [TAKEOFF] 持续发送 POSITION SETPOINT 爬升，到达后进入 OFFBOARD
+        [TAKEOFF] 等待 WAYPOINT(TAKEOFF) 完成，然后预热并切换 OFFBOARD
 
-        流程：
-          ① 每帧发送 POSITION 悬停/爬升 SETPOINT（预热 + 保持流）
-          ② 高度到达目标 90% → 发送 OFFBOARD 指令
-          ③ 模式切换确认 → 跳转到 NAVIGATING
+        流程（协议 §3.3.1）：
+          ① 等待高度到达目标 90% 且 mode == "HOLD"
+          ② 发送预热 SETPOINT（当前位置悬停）
+          ③ time.sleep(0.2) 等待流建立
+          ④ 发送 COMMAND("OFFBOARD")
+          ⑤ 轮询等待 mode == "OFFBOARD"
+          ⑥ 跳转 NAVIGATING
         """
         try:
             drone = state["drone"]
             alt_rel = drone.get("alt_rel", 0.0)
             mode = drone.get("mode", "")
-            target_up = -self.target_altitude   # 正值
+            target_up = -self.target_altitude  # 正值
 
-            # ---- ① 持续发送 POSITION SETPOINT（预热 OFFBOARD 流） ----
-            # 通过 MissionManager 自有 proxy 发送，此阶段 UAVControlLoop
-            # 的 20Hz 线程会被 run_mission.py 关闭，不会冲突。
-            # NED 坐标系：x=0,y=0,z=target_altitude 表示飞到正上方目标高度
+            # ---- ① 等待 TAKEOFF 完成 ----
+            # 协议要求：高度到达目标 90% 且模式为 HOLD
+            reached_alt = alt_rel >= target_up * 0.9
+            in_hold = mode == "HOLD"
+
+            if not (reached_alt and in_hold):
+                # 节流输出等待状态
+                self._throttle_log("takeoff_wait", 3.0,
+                                   "[起飞中] alt=%.1f/%.1f mode=%s 耗时=%.1fs",
+                                   alt_rel, target_up, mode,
+                                   time.time() - self._state_start_time)
+                return
+
+            # ---- ② 高度到位 + HOLD 模式 → 预热 + 切 OFFBOARD ----
+            logger.info("[TAKEOFF] 高度 %.1fm，模式 %s，准备切换 OFFBOARD...",
+                        alt_rel, mode)
+
+            # 先预热悬停（协议 §3.3.1 ③→④）
             self.proxy.send_setpoint(
-                x=0, y=0, z=self.target_altitude, yaw=0.0,
+                x=0, y=0, z=-alt_rel, yaw=0.0,
                 control_mode="POSITION",
             )
+            time.sleep(0.2)
 
-            # ---- ② 到达目标高度 → 进入 OFFBOARD ----
-            reached_alt = alt_rel >= target_up * 0.9
-
-            if reached_alt and mode != "OFFBOARD":
-                logger.info("[TAKEOFF] 高度 %.1f/%.1f，切换 OFFBOARD...",
-                            alt_rel, target_up)
-                # 先预热悬停（协议 §3.3.1 ③→④）
-                self.proxy.send_setpoint(
-                    x=0, y=0, z=-alt_rel, yaw=0.0,
-                    control_mode="POSITION",
-                )
-                time.sleep(0.2)
-
-                ok, ack = self.proxy.send_command("OFFBOARD")
-                if ok:
-                    # 等待模式切换
-                    for _ in range(int(self.OFFBOARD_TIMEOUT / 0.1)):
-                        st = self.proxy.get_latest_state()
-                        if st and st["drone"]["mode"] == "OFFBOARD":
-                            logger.info("[TAKEOFF] 已进入 OFFBOARD")
-                            break
-                        time.sleep(0.1)
-                    else:
-                        logger.warning("[TAKEOFF] OFFBOARD 切换超时")
-                else:
-                    logger.error("[TAKEOFF] OFFBOARD 指令失败: %s", ack)
-
-            # ---- ③ 高度到位 + OFFBOARD 模式 → 跳转巡航 ----
-            if reached_alt and mode == "OFFBOARD":
-                logger.info("\n[起飞完成] 高度 %.1fm，进入航点巡航", alt_rel)
-                self.state = MissionState.NAVIGATING
-                self.current_wp_index = 0
-                self._set_current_target_from_wp(0)
+            # 发送 OFFBOARD 指令
+            ok, ack = self.proxy.send_command("OFFBOARD")
+            if not ok:
+                logger.error("[TAKEOFF] OFFBOARD 指令失败: %s", ack)
+                # 超时后强行进入巡航（降级）
+                if time.time() - self._state_start_time > self.TAKEOFF_TIMEOUT:
+                    logger.warning("[TAKEOFF] 超时，强行进入巡航")
+                    self.state = MissionState.NAVIGATING
+                    self.current_wp_index = 0
+                    self._set_current_target_from_wp(0)
                 return
 
-            # ---- 爬升超时保护 ----
-            elapsed = time.time() - self._state_start_time
-            if elapsed > self.TAKEOFF_TIMEOUT:
-                logger.warning("[TAKEOFF] 超时 (%.1fs)，强行进入巡航", elapsed)
-                self.state = MissionState.NAVIGATING
-                self.current_wp_index = 0
-                self._set_current_target_from_wp(0)
-                return
+            # 等待模式切换
+            for _ in range(int(self.OFFBOARD_TIMEOUT / 0.1)):
+                st = self.proxy.get_latest_state()
+                if st and st["drone"]["mode"] == "OFFBOARD":
+                    logger.info("[TAKEOFF] 已进入 OFFBOARD")
+                    self.state = MissionState.NAVIGATING
+                    self.current_wp_index = 0
+                    self._set_current_target_from_wp(0)
+                    return
+                time.sleep(0.1)
 
-            # 节流：每 3 秒输出一次高度进度，不刷屏
-            self._throttle_log("takeoff", 3.0,
-                               "[起飞中] alt=%.1f/%.1f mode=%s 耗时=%.1fs",
-                               alt_rel, target_up, mode, elapsed)
+            # 超时
+            logger.warning("[TAKEOFF] OFFBOARD 切换超时，强行进入巡航")
+            self.state = MissionState.NAVIGATING
+            self.current_wp_index = 0
+            self._set_current_target_from_wp(0)
 
         except (KeyError, TypeError) as e:
             logger.warning("[TAKEOFF] 异常: %s", e)
