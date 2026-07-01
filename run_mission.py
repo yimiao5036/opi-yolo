@@ -334,7 +334,7 @@ class MissionOrchestrator:
                 hold_time = wp.get("param1", 8.0)   # 悬停时间（如有）
 
                 x, y, z = latlon_to_ned(lat, lon, alt, ref_lat, ref_lon, ref_alt)
-                print(f"航点信息；{x}{y}{z}")
+                # print(f"航点信息；{x}{y}{z}")
 
                 # 根据 MAV_CMD 类型构建内部航点
                 if cmd == 22:  # TAKEOFF

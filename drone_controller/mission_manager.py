@@ -360,7 +360,8 @@ class MissionManager:
                         mode, armed, alt_rel)
 
             if not home.get("valid", False):
-                logger.warning("[INIT] home.valid=false，等待起飞点有效...")
+                self._throttle_log("home_valid_init", 5.0,
+                                   "[INIT] home.valid=false，等待起飞点有效...")
                 return
 
             # A) 已在 OFFBOARD + 已解锁 → 直接巡航
@@ -412,7 +413,8 @@ class MissionManager:
                 return
 
             if not home.get("valid", False):
-                logger.warning("[ARMING] home.valid=false，等待起飞点有效...")
+                self._throttle_log("home_valid_arming", 5.0,
+                                   "[ARMING] home.valid=false，等待起飞点有效...")
                 return
 
             # ---- 解锁成功 → 起飞 ----
