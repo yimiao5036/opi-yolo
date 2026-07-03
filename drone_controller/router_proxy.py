@@ -105,6 +105,9 @@ class RouterProxy:
         self._alert_callback = None
         self._waypoints_callback = None
 
+        self._last_logged_msg_type = None  # 记录上次打印的消息类型
+        self._last_logged_ack_type = None 
+
     # ================================================================
     #  内部工具
     # ================================================================
@@ -255,31 +258,35 @@ class RouterProxy:
     # ================================================================
 
     def _send_req(self, msg):
-        """
-        发送 REQ 并等待 ACK 回复
-
-        ZeroMQ REQ-REP 是严格的交替模式：send → recv → send → recv
-        本方法保证每次调用完成一次完整的 send-recv 周期。
-
-        Returns:
-            (ok: bool, ack_dict: dict)
-            ack_dict 示例：{"type": "ACK", "ref_id": 1, "status": "OK", "message": ""}
-        """
         msg_type = msg.get("type", "?")
         msg_id = msg.get("id", "?")
         summary = self._build_send_summary(msg)
-        logger.debug("Sending %s id=%s: %s", msg_type, msg_id, summary)
-        logger.info("🚀 发送原始 JSON 指令: %s", json.dumps(msg))
+        
+        # ---- 发送日志：类型变化时才打印 ----
+        if msg_type != self._last_logged_msg_type:
+            self._last_logged_msg_type = msg_type
+            logger.debug("Sending %s id=%s: %s", msg_type, msg_id, summary)
+            logger.info("🚀 发送 %s (类型变化)", msg_type)
+        # 否则静默，不打印任何东西
+        
         try:
             self.req.send_string(json.dumps(msg))
             ack_str = self.req.recv_string()
             ack = json.loads(ack_str)
             ok = ack.get("status") == "OK"
-            logger.info("ACK received for id=%s, status=%s",
+            ack_type = ack.get("type", "ACK")  # 通常是 "ACK"
+            
+            # ---- ACK 日志：类型变化时才打印 ----
+            if ack_type != self._last_logged_ack_type:
+                self._last_logged_ack_type = ack_type
+                logger.info("ACK received for id=%s, status=%s", 
                         ack.get("ref_id"), ack.get("status"))
+            # 否则 ACK 也静默
+            
             if not ok:
-                logger.warning("ACK 非 OK: type=%s id=%s ack=%s",
-                               msg_type, msg_id, ack)
+                # 非 OK 状态无论如何都打印（这是异常）
+                logger.warning("ACK 非 OK: type=%s id=%s ack=%s", 
+                            msg_type, msg_id, ack)
             return ok, ack
         except zmq.Again:
             logger.error("REQ recv 超时 (type=%s id=%s)", msg_type, msg_id)
