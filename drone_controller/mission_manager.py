@@ -230,6 +230,19 @@ class MissionManager:
         if self.state not in (MissionState.INIT, MissionState.FINISHED):
             if state is not None:
                 mode = state["drone"].get("mode", "")
+                # 飞控切到 AUTO.LAND 或 AUTO.RTL → 自动让渡控制权
+                if mode in ("AUTO.LAND", "AUTO.RTL"):
+                    logger.warning(f"⚠️ 飞控切换到 {mode}，Python 端主动让渡控制权")
+                    # 根据模式决定切换到的状态
+                    if mode == "AUTO.LAND":
+                        self.state = MissionState.LANDING
+                    elif mode == "AUTO.RTL":
+                        self.state = MissionState.RETURNING
+                    # 重置状态开始时间，让降落/返航处理从当前帧开始
+                    self._state_start_time = time.time()
+                    # 停止控制线程（通过 run_mission.py 的协调逻辑）
+                    # 注意：state 变化后，下一帧 _coordinate_control 会自动停止线程
+                    return
                 if not self._is_mode_allowed_for_state(mode, self.state):
                     logger.warning(
                         "\n⚠️ [Failsafe] 飞控模式被切为: %s！"

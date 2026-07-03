@@ -709,6 +709,13 @@ class UAVControlLoop:
             # ---- ④ 通过 ZMQ 发送 VELOCITY SETPOINT（协议 §3.1 速度控制） ----
             self.logger.debug("SETPOINT: control_mode=VELOCITY "
                               "vx=%.2f vy=%.2f vz=%.2f", vx, vy, vz)
+            # ---- 防御性检查：飞控已切到 AUTO.LAND/AUTO.RTL 则不再发送 ----
+            state = self.proxy.get_latest_state()
+            if state:
+                mode = state.get("drone", {}).get("mode", "")
+                if mode in ("AUTO.LAND", "AUTO.RTL"):
+                    # 静默跳过，不发送 SETPOINT
+                    continue
             ok, ack = self.proxy.send_setpoint(
                 vx=vx, vy=vy, vz=vz,
                 yaw_rate=0.0,
