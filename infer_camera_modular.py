@@ -440,6 +440,14 @@ class UAVControlLoop:
         self._log_throttle = {}  # key → 上次打印时间戳
         self._brake_last_logged = False  # 刹车是否已输出过日志
 
+        # ---- 光流避障决策（外部注入） ----
+        self.obstacle_yaw_rate = 0.0
+        self.obstacle_speed_scale = 1.0
+        self.obstacle_active = False
+        self.cruise_speed = fc_cfg.get("cruise_speed", 1.0)   # 默认 1 m/s
+        # ---- 光流线程锁 ----
+        self._obstacle_lock = threading.Lock()
+
     def start_uav(self):
         """连接 Router，执行标准起飞序列（协议 §3.3.1）
 
@@ -647,6 +655,21 @@ class UAVControlLoop:
             self._tracked_result = result
 
         return tracked, result
+    
+    # ---- 光流避障决策 ----
+    def set_obstacle_decision(self, yaw_rate: float, speed_scale: float):
+        """
+        由外部注入光流避障决策。
+        当 yaw_rate != 0 或 speed_scale < 0.95 时视为激活。
+        """
+        with self._obstacle_lock:
+            self.obstacle_yaw_rate = yaw_rate
+            self.obstacle_speed_scale = speed_scale
+            self.obstacle_active = (abs(yaw_rate) > 0.02 or speed_scale < 0.95)
+            if self.obstacle_active:
+                self.logger.debug("光流避障激活: yaw=%.2f, scale=%.2f", yaw_rate, speed_scale)
+            else:
+                self.logger.debug("光流避障已清除")
 
     # ---- 内部控制线程 ----
 
@@ -703,12 +726,9 @@ class UAVControlLoop:
                 else:
                     self._brake_last_logged = False
 
-            # ---- 记录当前速度指令（供外部日志读取） ----
-            self._last_vx, self._last_vy, self._last_vz = vx, vy, vz
-
+            
             # ---- ④ 通过 ZMQ 发送 VELOCITY SETPOINT（协议 §3.1 速度控制） ----
-            self.logger.debug("SETPOINT: control_mode=VELOCITY "
-                              "vx=%.2f vy=%.2f vz=%.2f", vx, vy, vz)
+
             # ---- 防御性检查：飞控已切到 AUTO.LAND/AUTO.RTL 则不再发送 ----
             state = self.proxy.get_latest_state()
             if state:
@@ -716,9 +736,31 @@ class UAVControlLoop:
                 if mode in ("AUTO.LAND", "AUTO.RTL"):
                     # 静默跳过，不发送 SETPOINT
                     continue
+            # ---- 决策融合：光流避障是否覆盖 ----
+            with self._obstacle_lock:
+                if self.obstacle_active:
+                    # 避障模式：前向速度 × 缩放，偏航角速度由光流决策给出
+                    cmd_vx = self.cruise_speed * self.obstacle_speed_scale
+                    cmd_vy = 0.0
+                    cmd_vz = 0.0
+                    cmd_yaw_rate = self.obstacle_yaw_rate
+                else:
+                    # 正常追踪模式
+                    cmd_vx = vx       # 原逻辑 vx 始终为 0（可保留）
+                    cmd_vy = vy
+                    cmd_vz = vz
+                    cmd_yaw_rate = 0.0
+
+            # 记录当前速度指令（供外部日志读取）
+            self._last_vx, self._last_vy, self._last_vz = cmd_vx, cmd_vy, cmd_vz
+
+            # ---- ⑤ 通过 ZMQ 发送 VELOCITY SETPOINT ----
+            self.logger.debug("SETPOINT: control_mode=VELOCITY "
+                              "vx=%.2f vy=%.2f vz=%.2f yaw_rate=%.2f",
+                              cmd_vx, cmd_vy, cmd_vz, cmd_yaw_rate)
             ok, ack = self.proxy.send_setpoint(
-                vx=vx, vy=vy, vz=vz,
-                yaw_rate=0.0,
+                vx=cmd_vx, vy=cmd_vy, vz=cmd_vz,
+                yaw_rate=cmd_yaw_rate,
                 control_mode="VELOCITY"
             )
             if not ok and self.running:
@@ -726,7 +768,7 @@ class UAVControlLoop:
                 # recv 超时或格式错误由 _send_req 内部恢复 REQ socket
                 self.logger.warning("SETPOINT ACK 失败: %s", ack)
 
-            # ---- ⑤ 精确控制循环频率（20Hz → 每 50ms） ----
+            # ---- ⑥ 精确控制循环频率（20Hz → 每 50ms） ----
             elapsed = time.time() - start
             sleep_time = self.control_interval - elapsed
             if sleep_time > 0:

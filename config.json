@@ -17,6 +17,7 @@
         "sub_endpoint": "tcp://127.0.0.1:5556",
         "takeoff_alt": 5.0,
         "control_hz": 20,
+        "cruise_speed":1.0,
         "target_tracker": {
             "max_lost_frames": 8,
             "max_asscociation_dist": 200.0,
@@ -39,10 +40,21 @@
         "return_to_home": false,
         "target_lost_timeout": null
     },
+    "optical_flow":{
+        "grid_step":25,
+        "reset_threshold":30
+    },
     "log": {
     "enable_flight_log": true,
     "flight_log_interval": 20,
     "log_dir": "./log"
+    },
+    "pid_x":{
+        "kp": 1.2,
+        "ki": 0.1,
+        "kd": 0.05,
+        "max_out": 0.8,
+        "min_out": -0.8
     },
     "pid_y": {
         "kp": 1.0,
@@ -57,5 +69,12 @@
         "kd": 0.3,
         "max_out": 0.4,
         "min_out": -0.4
+    },
+    "pid_yaw":{
+        "kp":0.8,
+        "ki":0.05,
+        "kd":0.0,
+        "max_out":1.0,
+        "min_out":0.0
     }
 }

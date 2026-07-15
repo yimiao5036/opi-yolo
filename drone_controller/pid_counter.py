@@ -15,6 +15,8 @@ class PID:
         self.last_err = 0.0
         self.integral = 0.0
         self.last_time = time.time()
+        # 积分冻结标志位，默认为不冻结（False）
+        self.integral_frozen = False
 
     def update(self, error):
         """
@@ -28,8 +30,11 @@ class PID:
         # 1. 比例项
         p_out = self.kp * error
 
-        # 2. 积分项（增加累加计算，并对积分做出局部限幅防止初段积分饱和）
-        self.integral += error * dt
+        # 2. 积分项
+        # 增加策略：只有在未冻结时，才进行积分累加
+        if not self.integral_frozen:
+            self.integral += error * dt
+            
         i_out = self.ki * self.integral
         # 将积分上限限制在总输出幅值的 20%
         i_out = max(min(i_out, self.max_out * 0.2), self.min_out * 0.2)
@@ -56,12 +61,41 @@ class PID:
         self.last_err = 0.0
         self.integral = 0.0
         self.last_time = time.time()
+        self.integral_frozen = False  # 重置时默认恢复积分功能
 
     def reset_integral(self):
         """
         仅清空积分项（I term），保留上一帧误差以维持微分（D term）连续性
-
-        用于卡尔曼 coast（滑行预测）期间：
-          只靠比例 (P) + 微分 (D) 稳住，积分项清零防止过冲。
+            用于卡尔曼 coast（滑行预测）期间：
+            只靠比例 (P) + 微分 (D) 稳住，积分项清零防止过冲。
         """
         self.integral = 0.0
+
+    # ================== 新增方法 ==================
+
+    def freeze_integral(self):
+        """
+        冻结积分项：
+        保持当前的积分值（保持之前的成果），但不再随时间累加新的误差。
+        
+        适用场景：执行机构饱和（如马达已满载）、或者进入特定暂态过程。
+        """
+        self.integral_frozen = True
+
+    def unfreeze_integral(self, mode="maintain"):
+        """
+        配套解冻策略：
+        
+        :param mode: 解冻模式选择
+            - "maintain": 保持冻结期间的值，直接从该点继续累加（最常用，平滑过渡）。
+            - "clear": 解冻的同时清空历史积分，完全重新开始。
+            - "fade": 仅保持原有积分的 50%（衰减），防止突变过冲。
+        """
+        self.integral_frozen = False
+        
+        if mode == "clear":
+            self.integral = 0.0
+        elif mode == "fade":
+            self.integral *= 0.5
+        elif mode == "maintain":
+            pass # 保持原样，直接继续累加

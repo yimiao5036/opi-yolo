@@ -239,7 +239,7 @@ def calculate_target_gps(ptz_lat, ptz_lon, ptz_alt, pan, tilt, distance):
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     # 实际测试时请修改为光电外设的正确 IP
-    sock.connect(('192.168.1.64', 39020))
+    sock.connect(('10.10.61.64', 39020))
 
     # 【修复 Bug 2】：传入文档推测的默认密码 'Abc.12345'
     token = login_to_ipc(sock, 'admin', 'Abc.12345')

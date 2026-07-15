@@ -61,6 +61,8 @@ from drone_controller.router_proxy import RouterProxy
 # run_mission.py 在外部协调其控制线程的启停。
 from infer_camera_modular import UAVControlLoop, VideoStreaming, YOLO26UAVInfer
 # 注：coord.latlon_to_ned 不再需要 — 航点直接存储原始经纬度
+# ---- 光流模块 ----
+from drone_controller.optical_flow_controller import OpticalFlowObstacleDetector
 
 logger = logging.getLogger("RunMission")
 
@@ -127,6 +129,15 @@ class MissionOrchestrator:
             arrival_radius=missions.get("arrival_radius", 0.3),
             hold_duration=missions.get("hold_duration", 5.0),
             return_to_home=missions.get("return_to_home", True),
+        )
+
+        # ================================================================
+        # 💡 OpticalFlowObstacleDetector （光流计算）
+        # ================================================================
+        flow_cfg = cfg.get("optical_flow", {})
+        self.optical_flow = OpticalFlowObstacleDetector(
+            grid_step=flow_cfg.get("grid_step", 25),
+            reset_threshold=flow_cfg.get("reset_threshold", 30.0)
         )
 
         # ================================================================
@@ -554,6 +565,15 @@ class MissionOrchestrator:
                 self._coordinate_control(current_state, prev_state,
                                          detections, orig_shape)
                 prev_state = current_state
+
+                # ---- 光流避障决策 ----
+                if self.mission.state == MissionState.VISUAL_TRACKING:
+                    _, _ = self.optical_flow.process_frame(frame)
+                    yaw_setpoint, speed_scale = self.optical_flow.get_zone_decision()
+                    self.controller.set_obstacle_decision(yaw_setpoint, speed_scale)
+                else:
+                    # 非追踪状态清除避障
+                    self.controller.set_obstacle_decision(0.0, 1.0)
 
                 # ---- ④ 状态机更新 ----
                 self.mission.update(target_detected=target_detected)
