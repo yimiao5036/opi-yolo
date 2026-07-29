@@ -253,7 +253,8 @@ class VideoStreaming:
 
                 send_count += 1
                 if send_count % 100 == 0:
-                    self.logger.info("图传统计: 已发送 %d 帧 UDP 数据包", send_count)
+                    # self.logger.info("图传统计: 已发送 %d 帧 UDP 数据包", send_count)
+                    pass
 
             except queue.Empty:
                 continue

@@ -106,7 +106,12 @@ class RouterProxy:
         self._waypoints_callback = None
 
         self._last_logged_msg_type = None  # 记录上次打印的消息类型
-        self._last_logged_ack_type = None 
+        self._last_logged_ack_type = None
+        self._setpoint_log_allowed = True  # SETPOINT 日志是否允许输出（每个航点重置一次）
+
+        # ---- 日志节流：STATE 过期警告 ----
+        self._last_stale_warn_time = 0.0   # 上次 "STATE 过期" 日志时间
+        self._last_severe_warn_time = 0.0  # 上次 "STATE 严重过期" 日志时间
 
     # ================================================================
     #  内部工具
@@ -125,6 +130,12 @@ class RouterProxy:
             self._seq += 1
             return current_seq
 
+
+    def reset_setpoint_log(self):
+        """重置 SETPOINT 日志输出标记（新航点开始时调用，使下一个 SETPOINT 可被打印）"""
+        self._setpoint_log_allowed = True
+        self._last_logged_msg_type = None
+        self._last_logged_ack_type = None
 
     def _build_send_summary(self, msg: dict) -> str:
         """构建发送消息的内容概要，用于日志"""
@@ -262,26 +273,32 @@ class RouterProxy:
         msg_id = msg.get("id", "?")
         summary = self._build_send_summary(msg)
         
-        # ---- 发送日志：类型变化时才打印 ----
-        if msg_type != self._last_logged_msg_type:
-            self._last_logged_msg_type = msg_type
-            logger.debug("Sending %s id=%s: %s", msg_type, msg_id, summary)
-            logger.info("🚀 发送 %s (类型变化)", msg_type)
-        # 否则静默，不打印任何东西
+        # ---- 发送日志 ----
+        should_log = False
+        if msg_type == "SETPOINT":
+            # SETPOINT：每个航点只打印第一次
+            if self._setpoint_log_allowed:
+                self._setpoint_log_allowed = False
+                should_log = True
+        else:
+            # 非 SETPOINT（COMMAND / WAYPOINT / QUERY）：类型变化时打印
+            if msg_type != self._last_logged_msg_type:
+                self._last_logged_msg_type = msg_type
+                should_log = True
+
+        if should_log:
+            logger.info("🚀 发送 %s id=%s: %s", msg_type, msg_id, summary)
         
         try:
             self.req.send_string(json.dumps(msg))
             ack_str = self.req.recv_string()
             ack = json.loads(ack_str)
             ok = ack.get("status") == "OK"
-            ack_type = ack.get("type", "ACK")  # 通常是 "ACK"
             
-            # ---- ACK 日志：类型变化时才打印 ----
-            if ack_type != self._last_logged_ack_type:
-                self._last_logged_ack_type = ack_type
+            # ---- ACK 日志：与发送日志同步，只在对应发送被打印时输出 ----
+            if should_log:
                 logger.info("ACK received for id=%s, status=%s", 
-                        ack.get("ref_id"), ack.get("status"))
-            # 否则 ACK 也静默
+                            ack.get("ref_id"), ack.get("status"))
             
             if not ok:
                 # 非 OK 状态无论如何都打印（这是异常）
@@ -334,12 +351,18 @@ class RouterProxy:
         except (KeyError, TypeError):
             return False
         if age_us >= stale_threshold_us:
+            # 日志节流：间隔 ≥ THROTTLE_INTERVAL 秒才打印一次
+            now = time.time()
             if age_us >= self.STALE_THRESHOLD_WARN_US:
-                logger.warning("STATE 严重过期: age=%.2fs（阈值=%.0fms）",
-                               age_us / 1e6, stale_threshold_us / 1000)
+                if now - self._last_severe_warn_time >= 5.0:
+                    self._last_severe_warn_time = now
+                    logger.warning("STATE 严重过期: age=%.2fs（阈值=%.0fms）",
+                                   age_us / 1e6, stale_threshold_us / 1000)
             else:
-                logger.warning("STATE 过期: age=%.1fms（阈值=%.0fms）",
-                               age_us / 1000, stale_threshold_us / 1000)
+                if now - self._last_stale_warn_time >= 5.0:
+                    self._last_stale_warn_time = now
+                    logger.warning("STATE 过期: age=%.1fms（阈值=%.0fms）",
+                                   age_us / 1000, stale_threshold_us / 1000)
         return age_us < stale_threshold_us
 
     def get_state_freshness(self, state):

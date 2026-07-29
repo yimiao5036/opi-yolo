@@ -38,7 +38,12 @@
         "arrival_radius": 0.3,
         "hold_duration": 8.0,
         "return_to_home": false,
-        "target_lost_timeout": null
+        "target_lost_timeout": null,
+        "max_speed": 1.2,
+        "landing": {
+            "pre_hover_duration": 3.0,
+            "descent_speed": 0.3
+        }
     },
     "optical_flow":{
         "grid_step":25,

@@ -122,6 +122,7 @@ class MissionOrchestrator:
         self.proxy.set_waypoints_callback(self._on_qgc_waypoints)
 
         missions = cfg["missions"]
+        landing_cfg = missions.get("landing", {})
         self.mission = MissionManager(
             proxy=self.proxy,
             waypoints=self.waypoints,
@@ -129,6 +130,9 @@ class MissionOrchestrator:
             arrival_radius=missions.get("arrival_radius", 0.3),
             hold_duration=missions.get("hold_duration", 5.0),
             return_to_home=missions.get("return_to_home", True),
+            max_speed=missions.get("max_speed", 1.2),
+            pre_land_hover_duration=landing_cfg.get("pre_hover_duration", 3.0),
+            landing_descent_speed=landing_cfg.get("descent_speed", 0.3),
         )
 
         # ================================================================
