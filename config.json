@@ -35,7 +35,7 @@
     },
     "missions": {
         "target_altitude": 3.0,
-        "arrival_radius": 0.3,
+        "arrival_radius": 2.5,
         "hold_duration": 8.0,
         "return_to_home": false,
         "target_lost_timeout": null,

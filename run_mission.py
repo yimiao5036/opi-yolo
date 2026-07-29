@@ -227,8 +227,8 @@ class MissionOrchestrator:
                         "command": "WAYPOINT",
                         "hold_duration": hold_time,
                     })
-                    self.logger.debug("航点 %d [WAYPOINT]: lat=%.6f lon=%.6f alt=%.1f",
-                                      idx, lat, lon, alt)
+                    self.logger.info("航点 %d [WAYPOINT]: lat=%.6f lon=%.6f alt=%.1f",
+                                     idx, lat, lon, alt)
 
             self.mission.set_waypoints(converted)
 
