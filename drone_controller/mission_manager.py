@@ -118,6 +118,25 @@ class MissionManager:
     OFFBOARD_TIMEOUT = 5.0
     ARM_TIMEOUT = 5.0
 
+    # ================================================================
+    #  状态切换日志（property 拦截所有 self.state = X 赋值）
+    # ================================================================
+
+    @property
+    def state(self):
+        return self._state
+
+    @state.setter
+    def state(self, new_state):
+        old_state = getattr(self, '_state', None)
+        if old_state is not new_state:
+            logger.info("🔄 [状态切换] %s → %s",
+                         old_state.name if old_state is not None else "∅",
+                         new_state.name)
+        self._state = new_state
+
+    # ================================================================
+
     def __init__(self, proxy, waypoints, target_altitude=1.5,
                  arrival_radius=0.3, hold_duration=5.0,
                  return_to_home=True, target_lost_timeout=None,
@@ -138,6 +157,9 @@ class MissionManager:
         """
         # ---- 依赖注入 ----
         self.proxy = proxy
+
+        # ---- 状态初始值（property 用 _state，须在任何 self.state = 前初始化） ----
+        self._state = None
 
         # ---- 任务参数 ----
         # 航点列表（经纬度协议 v2：[{lat, lon, alt, yaw, command}, ...]）

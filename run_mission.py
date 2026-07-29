@@ -46,8 +46,6 @@ import threading
 import time
 import socket
 import cv2
-import queue
-import csv
 
 from drone_controller.mission_manager import (
     MissionManager,
@@ -61,6 +59,8 @@ from drone_controller.router_proxy import RouterProxy
 # run_mission.py 在外部协调其控制线程的启停。
 from infer_camera_modular import UAVControlLoop, VideoStreaming, YOLO26UAVInfer
 # 注：coord.latlon_to_ned 不再需要 — 航点直接存储原始经纬度
+# ---- 飞行日志 ----
+from utils.flight_logger import FlightLogger
 # ---- 光流模块 ----
 from drone_controller.optical_flow_controller import OpticalFlowObstacleDetector
 
@@ -97,16 +97,7 @@ class MissionOrchestrator:
         # csv飞行日志参数
         # ================================================================
         log_cfg = cfg.get("log", {})
-        self.flight_log_enabled = log_cfg.get("enable_flight_log", True)
-        self.flight_log_interval = log_cfg.get("flight_log_interval", 20)  # 20帧 ≈ 1秒
-        self.log_dir = log_cfg.get("log_dir", "./log")
-        self._log_queue = queue.Queue(maxsize=500)  # 最多缓存500条，防止内存泄漏
-        self._log_thread = None
-        self._log_running = False
-        self._log_frame_counter = 0
-        self._log_file_path = None
-        self._log_worker_started = False
-
+        self.flight_logger = FlightLogger(log_cfg)
         self._latest_detections = None
 
         # ================================================================
@@ -167,141 +158,6 @@ class MissionOrchestrator:
 
         self.logger.info("MissionOrchestrator 初始化完成")
 
-    # ================================================================
-    # 📝 飞行日志相关
-    # ================================================================
-    def _start_flight_logger(self):
-        """启动异步日志后台线程"""
-        if not self.flight_log_enabled:
-            self.logger.info("📝 飞行日志已禁用（config 中 enable_flight_log=false）")
-            return
-
-        if self._log_worker_started:
-            return
-
-        # 确保日志目录存在
-        os.makedirs(self.log_dir, exist_ok=True)
-
-        # 生成日志文件名（按时间命名）
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        self._log_file_path = os.path.join(self.log_dir, f"flight_{timestamp}.csv")
-
-        # 写入 CSV 表头（如果文件不存在）
-        with open(self._log_file_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'timestamp_unix',
-                'alt_rel_m',
-                'ground_speed_mps',
-                'vx', 'vy', 'vz',
-                'battery_percent',
-                'state',
-                'wp_index',
-                'detect_count',
-                'tracking_active'
-            ])
-
-        self._log_running = True
-        self._log_thread = threading.Thread(
-            target=self._flight_log_worker,
-            daemon=True,
-            name="flight-log-writer"
-        )
-        self._log_thread.start()
-        self._log_worker_started = True
-        self.logger.info(f"📝 异步飞行日志已启动 -> {self._log_file_path} (降采样: 每{self.flight_log_interval}帧写1次)")
-
-    def _flight_log_worker(self):
-        """后台线程：从队列取数据，批量写入 CSV"""
-        buffer = []
-        BATCH_SIZE = 10  # 攒够 10 条一次性写入，减少 I/O
-
-        while self._log_running:
-            try:
-                # 阻塞等待 1 秒，有数据则取，超时则检查是否退出
-                item = self._log_queue.get(timeout=1.0)
-                if item is None:  # 停止信号
-                    break
-                buffer.append(item)
-
-                # 攒够一批或队列为空且需要退出时写入
-                if len(buffer) >= BATCH_SIZE:
-                    self._flush_log_buffer(buffer)
-                    buffer = []
-
-            except queue.Empty:
-                # 超时无数据，检查是否还有残留
-                if not self._log_running and not self._log_queue.empty():
-                    # 收尾：把剩余的数据写完
-                    while not self._log_queue.empty():
-                        try:
-                            buffer.append(self._log_queue.get_nowait())
-                        except queue.Empty:
-                            break
-                    if buffer:
-                        self._flush_log_buffer(buffer)
-                continue
-            except Exception as e:
-                self.logger.error(f"飞行日志线程异常: {e}")
-                time.sleep(0.1)
-
-        # 最终收尾：清空缓冲区
-        if buffer:
-            self._flush_log_buffer(buffer)
-        self.logger.info("📝 飞行日志线程已停止")
-
-    def _flush_log_buffer(self, buffer):
-        """将缓冲区数据写入 CSV 文件（由后台线程调用）"""
-        if not buffer or not self._log_file_path:
-            return
-        try:
-            with open(self._log_file_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerows(buffer)
-        except Exception as e:
-            self.logger.error(f"写入飞行日志失败: {e}")
-
-    # run_mission.py — MissionOrchestrator 类中新增
-
-    def _collect_and_enqueue_log(self):
-        """采集当前飞行状态，推入日志队列（主线程执行，极轻量）"""
-        try:
-            state = self.proxy.get_latest_state()
-            if state is None:
-                return
-
-            drone = state.get("drone", {})
-            # 当前状态机的状态
-            current_state = self.mission.state.name if self.mission else "UNKNOWN"
-            wp_idx = self.mission.current_wp_index if self.mission else 0
-            # 追踪线程是否激活（来自控制权协调标志）
-            tracking_active = 1 if self._control_active else 0
-
-            # 组装日志行（顺序要与 CSV 表头一致）
-            row = (
-                time.time(),  # timestamp_unix
-                drone.get("alt_rel", 0.0),  # alt_rel_m
-                drone.get("ground_speed", 0.0),  # ground_speed_mps
-                drone.get("vx", 0.0),  # vx
-                drone.get("vy", 0.0),  # vy
-                drone.get("vz", 0.0),  # vz
-                drone.get("battery", 0.0),  # battery_percent
-                current_state,  # state (string)
-                wp_idx,  # wp_index
-                len(self._latest_detections) if self._latest_detections is not None else 0,  # detect_count
-                tracking_active  # tracking_active
-            )
-
-            # 非阻塞推入队列（如果队列满了，丢弃旧数据，防止内存爆炸）
-            try:
-                self._log_queue.put_nowait(row)
-            except queue.Full:
-                # 队列满了说明写入线程跟不上，丢掉这条数据，记录警告（但不要经常触发）
-                pass
-
-        except Exception as e:
-            # 日志采集失败不影响主循环
-            pass
     # ================================================================
     # 📥 QGC 航点回调（由 RouterProxy 的 SUB 线程触发）
     # ================================================================
@@ -506,8 +362,7 @@ class MissionOrchestrator:
         if cmd_cfg.get("enabled", True):
             self._start_tcp_command_server()
 
-        # ---- 启动异步飞行日志 ----
-        self._start_flight_logger()
+        # ---- 飞行日志由 FlightLogger 在构造时自动启动 ----
 
         self.running = True
         self.logger.info("🚀 所有子系统就绪，主循环启动")
@@ -587,10 +442,14 @@ class MissionOrchestrator:
                 self.streamer.push_to_stream(frame)
 
                 # ---- 采集飞行日志 ----
-                if self.flight_log_enabled and self._log_worker_started:
-                    self._log_frame_counter += 1
-                    if self._log_frame_counter % self.flight_log_interval == 0:
-                        self._collect_and_enqueue_log()
+                if self.flight_logger.enabled and self.flight_logger.should_collect():
+                    self.flight_logger.collect(
+                        state=self.proxy.get_latest_state(),
+                        mission_state_name=self.mission.state.name,
+                        wp_index=self.mission.current_wp_index,
+                        detect_count=len(self._latest_detections) if self._latest_detections is not None else 0,
+                        tracking_active=1 if self._control_active else 0,
+                    )
 
                 # ---- 频率控制 ----
                 elapsed = time.time() - loop_start
@@ -751,17 +610,7 @@ class MissionOrchestrator:
         self._stop_control_thread()
 
         # ---- 停止飞行日志线程 ----
-        if self._log_running:
-            self._log_running = False
-            # 给队列发送停止信号
-            try:
-                self._log_queue.put_nowait(None)
-            except queue.Full:
-                pass
-
-            if self._log_thread and self._log_thread.is_alive():
-                self._log_thread.join(timeout=2.0)
-                self.logger.info("✔ 飞行日志线程已停止")
+        self.flight_logger.stop()
 
         # 2. 关闭共享 ZMQ 代理（MissionManager + UAVControlLoop 共用）
         #    注意：UAVControlLoop 不拥有 proxy 生命周期（_owns_proxy=False），
