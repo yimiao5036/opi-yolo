@@ -242,11 +242,7 @@ class MissionManager:
         if self.state not in (MissionState.INIT, MissionState.FINISHED):
             if state is not None:
                 if not self.proxy.is_state_fresh(state):
-                    age_us, _ = self.proxy.get_state_freshness(state)
-                    age_s = (age_us or 0) / 1_000_000
-                    self._throttle_log("stale_state", 5.0,
-                                       "⚠️ STATE 严重过期 (age=%.2fs)，"
-                                       "本轮保守跳过", age_s, level=logging.WARNING)
+                    # 过期警告已由 is_state_fresh 内部输出，此处不重复打印
                     return
             else:
                 logger.warning("⚠️ 尚未收到 STATE，跳过本轮处理")
@@ -267,7 +263,11 @@ class MissionManager:
                 mode = state["drone"].get("mode", "")
                 # 飞控切到 AUTO.LAND 或 AUTO.RTL → 自动让渡控制权
                 if mode in ("AUTO.LAND", "AUTO.RTL"):
-                    logger.warning(f"⚠️ 飞控切换到 {mode}，Python 端主动让渡控制权")
+                    # 去重：同一 mode 只在首次出现时打印，避免每帧刷屏
+                    self._throttle_log_on_change(
+                        "yield_mode", mode,
+                        "⚠️ 飞控切换到 %s，Python 端主动让渡控制权", mode,
+                        level=logging.WARNING)
                     # 根据模式决定切换到的状态
                     if mode == "AUTO.LAND":
                         self.state = MissionState.LANDING

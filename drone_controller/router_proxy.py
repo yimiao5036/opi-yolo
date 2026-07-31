@@ -113,6 +113,9 @@ class RouterProxy:
         self._last_stale_warn_time = 0.0   # 上次 "STATE 过期" 日志时间
         self._last_severe_warn_time = 0.0  # 上次 "STATE 严重过期" 日志时间
 
+        # ---- 日志节流：PX4_ACK 按 (cmd, result) 去重 ----
+        self._last_ack_log_time = {}       # {(cmd, result): 上次打印时间}
+
     # ================================================================
     #  内部工具
     # ================================================================
@@ -354,7 +357,8 @@ class RouterProxy:
             # 日志节流：间隔 ≥ THROTTLE_INTERVAL 秒才打印一次
             now = time.time()
             if age_us >= self.STALE_THRESHOLD_WARN_US:
-                if now - self._last_severe_warn_time >= 5.0:
+                # 严重过期（长时断流）30 秒提示一次即可，避免持续刷屏
+                if now - self._last_severe_warn_time >= 30.0:
                     self._last_severe_warn_time = now
                     logger.warning("STATE 严重过期: age=%.2fs（阈值=%.0fms）",
                                    age_us / 1e6, stale_threshold_us / 1000)
@@ -469,8 +473,14 @@ class RouterProxy:
                             logger.error("ALERT 回调异常: %s", e)
 
                 elif msg_type == "PX4_ACK":
-                    logger.info("PX4_ACK: cmd=%s result=%s",
-                                data.get("ref_cmd"), data.get("result"))
+                    # 节流：相同 (cmd, result) 30 秒内只打印一次，新组合立即可见
+                    ack_key = (data.get("ref_cmd"), data.get("result"))
+                    now = time.time()
+                    last = self._last_ack_log_time.get(ack_key, 0)
+                    if now - last >= 30.0:
+                        self._last_ack_log_time[ack_key] = now
+                        logger.info("PX4_ACK: cmd=%s result=%s",
+                                    data.get("ref_cmd"), data.get("result"))
 
                 elif msg_type == "QGC_WAYPOINTS":
                     logger.info("📥 收到 QGC_WAYPOINTS: count=%d", data.get("count", 0))
