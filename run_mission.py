@@ -13,7 +13,7 @@ run_mission.py — 基于 ZMQ Router 协议的主任务入口
          ▼              ▼
     ┌─ MissionManager   ┌─ UAVControlLoop ──┐
     │  状态机 + 航点巡航  │  20Hz VELOCITY    │
-    │  POSITION SETPOINT │  闭环追踪          │
+    │  VELOCITY SETPOINT │  闭环追踪          │
     │  (非追踪期间)      │  (VISUAL_TRACKING) │
     └───────────────────┴────────────────────┘
     ┌─ 感知模块 ─────────┐
@@ -23,7 +23,8 @@ run_mission.py — 基于 ZMQ Router 协议的主任务入口
 
 【控制权协调规则】
   同一时刻只有一个人持有「SETPOINT 发令权」：
-    - VISUAL_TRACKING 之外 → MissionManager 发 POSITION SETPOINT
+    - VISUAL_TRACKING 之外 → MissionManager 发 VELOCITY SETPOINT（航点/
+      悬停均用速度闭环，与坐标系无关；仅 TAKEOFF 预热用零偏移 POSITION）
     - VISUAL_TRACKING 之中 → UAVControlLoop 线程发 VELOCITY SETPOINT
     - 切换由主循环检测 MissionManager.state 变化时触发
 
@@ -479,7 +480,7 @@ class MissionOrchestrator:
         ┌──────────────┬─────────────────────┬──────────────────────┐
         │ 状态机状态    │ MissionManager      │ UAVControlLoop       │
         ├──────────────┼─────────────────────┼──────────────────────┤
-        │ 非 TRACKING  │ proxy → POSITION    │ 控制线程已停止        │
+        │ 非 TRACKING  │ proxy → VELOCITY    │ 控制线程已停止        │
         │              │   SETPOINT          │                      │
         ├──────────────┼─────────────────────┼──────────────────────┤
         │ TRACKING     │ 不发 SETPOINT       │ 20Hz VELOCITY 线程   │

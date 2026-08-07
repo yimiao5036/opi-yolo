@@ -2,9 +2,17 @@
 mission_manager.py — 基于 ZeroMQ RouterProxy 的航点巡航状态机
 
 【协议变更 v2 — 2026-07】
-  航点存储格式使用经纬度 (lat, lon, alt)。发送 POSITION SETPOINT
-  时在本模块内转换为相对当前位置的 LOCAL_OFFSET_NED 偏移
-  (x=北向, y=东向, z=向下)。
+  航点存储格式使用经纬度 (lat, lon, alt)。导航/返航/悬停均发送
+  VELOCITY SETPOINT：把目标经纬度换算成相对当前位置的 NED 方向，
+  再按 max_speed 限速成速度命令（差分量，与参考原点无关）。
+
+【坐标系说明 — 2026-08 修复】
+  此前 POSITION LOCAL_OFFSET_NED 路径用 GPS 经纬度反算相对偏移，
+  交给 PX4 在自身 LOCAL_NED 帧解析。GPS 与本地估计一旦不一致
+  （跳变/漂移），目标跟着跳、飞控满速追（实测 HOLD_FINAL 7.77m/s）。
+  故 HOLD_TASK / HOLD_FINAL 悬停改为速度闭环，从根上消除
+  GPS↔本地帧混用。POSITION setpoint 仅保留给 TAKEOFF 预热/降级爬升
+  （零水平偏移，且已加单帧钳制）。
 
 【核心改动】
   1. self.drone → self.proxy（注入的 RouterProxy 实例）
@@ -670,12 +678,14 @@ class MissionManager:
             self.tracking_completed = False
             return
 
-        # ---- 保持当前位置悬停（相对当前位置 LOCAL_OFFSET_NED） ----
+        # ---- 保持当前位置悬停（速度闭环，坐标系一致） ----
+        # 说明：悬停不用 POSITION LOCAL_OFFSET_NED。位置模式把"由 GPS 经纬度
+        # 反算的相对偏移"交给 PX4 在自身 LOCAL_NED 帧里解析，GPS 与本地估计
+        # 一旦不一致（跳变/漂移），目标跟着跳、飞控满速追（曾实测 7.77m/s）。
+        # 速度模式是差分量，与参考原点无关，命令值即速度上界，天然安全。
         wp = self.waypoints[self.current_wp_index]
-        self._send_relative_position_setpoint(
-            state,
-            wp["lat"], wp["lon"], wp.get("alt", self.target_altitude),
-            yaw=wp.get("yaw", 0),
+        self._send_velocity_to_target(
+            state, wp["lat"], wp["lon"], wp.get("alt", self.target_altitude),
         )
         self.current_target = {
             "lat": wp["lat"], "lon": wp["lon"],
@@ -857,7 +867,8 @@ class MissionManager:
         """
         [HOLD_FINAL] 末端悬停，保持最终航点位置
 
-        POSITION SETPOINT 发送 LOCAL_OFFSET_NED 相对偏移。
+        使用速度闭环（_send_velocity_to_target）而非 POSITION LOCAL_OFFSET_NED，
+        避免 GPS 偏移与 PX4 本地坐标系不一致导致飞控满速追目标（曾实测 7.77m/s）。
         """
         if self.waypoints:
             final_wp = self.waypoints[-1]
@@ -865,11 +876,10 @@ class MissionManager:
             final_wp = {"lat": 0.0, "lon": 0.0,
                         "alt": self.target_altitude, "yaw": 0}
 
-        self._send_relative_position_setpoint(
+        self._send_velocity_to_target(
             state,
             final_wp["lat"], final_wp["lon"],
             final_wp.get("alt", self.target_altitude),
-            yaw=final_wp.get("yaw", 0),
         )
         self.current_target = {
             "lat": final_wp["lat"], "lon": final_wp["lon"],
@@ -886,8 +896,23 @@ class MissionManager:
     # ================================================================
 
     def _send_relative_position_setpoint(self, state, target_lat, target_lon,
-                                         target_alt, yaw=0.0):
-        """按相对当前位置的 LOCAL_OFFSET_NED 发送 POSITION SETPOINT。"""
+                                         target_alt, yaw=0.0, max_speed=None):
+        """
+        按相对当前位置的 LOCAL_OFFSET_NED 发送 POSITION SETPOINT。
+
+        统一限速：位置设定点按单帧最大推进距离 max_step 钳制，
+        即大偏移被拆成多帧逐步逼近，从源头避免飞控满速冲撞。
+        （此前 HOLD_FINAL 阶段曾因偏移异常出现 7.77m/s 失控）
+
+        max_step = max(max_speed * 0.5, 0.3)。正常悬停（偏移 < 0.3m）
+        不受影响；异常大偏移被钳制的同时打印 WARNING 便于诊断。
+
+        Args:
+            max_speed: 限速（m/s），默认 self.max_speed
+        """
+        if max_speed is None:
+            max_speed = self.max_speed
+
         drone = state.get("drone", {}) if state else {}
         current_lat = drone.get("lat", 0.0)
         current_lon = drone.get("lon", 0.0)
@@ -897,6 +922,19 @@ class MissionManager:
             target_lat, target_lon, target_alt,
             current_lat, current_lon, current_alt,
         )
+
+        # ---- 统一限速：单帧最大目标偏移（约半个限速秒距离） ----
+        max_step = max(max_speed * 0.5, 0.3)
+        dist_h = math.sqrt(x * x + y * y)
+        if dist_h > max_step * 1.5:
+            logger.warning(
+                "[限速] POSITION 偏移过大 %.1fm，钳制为 %.1fm（max_speed=%.1f）",
+                dist_h, max_step, max_speed)
+        if dist_h > max_step:
+            x = x / dist_h * max_step
+            y = y / dist_h * max_step
+        # 垂直方向同样钳制（z>0 表示目标在下）
+        z = max(min(z, max_step), -max_step)
 
         return self.proxy.send_setpoint(
             x=x, y=y, z=z, yaw=yaw,
