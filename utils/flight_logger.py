@@ -78,7 +78,9 @@ class FlightLogger:
                 'state',
                 'wp_index',
                 'detect_count',
-                'tracking_active'
+                'tracking_active',
+                'yaw',          # 姿态偏航角 (rad)
+                'heading'       # GPS 航向角 (deg)
             ])
 
         self._running = True
@@ -188,6 +190,8 @@ class FlightLogger:
                 wp_index,                          # wp_index
                 detect_count,                      # detect_count
                 tracking_active,                   # tracking_active
+                drone.get("yaw", 0.0),             # yaw: 姿态偏航角 (rad)
+                drone.get("heading", 0.0),         # heading: GPS 航向角 (deg)
             )
 
             # 非阻塞入队，满则丢弃
