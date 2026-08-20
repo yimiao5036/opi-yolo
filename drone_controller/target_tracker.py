@@ -3,11 +3,11 @@ target_tracker.py — 轻量级多目标追踪过滤器
 
 【解决的问题】
   1. 目标短暂丢帧（2-5帧）导致无人机抽搐 → 卡尔曼滤波 coast/predict 平滑过渡
-  2. 多目标 ID 飘移导致甩头 → 最邻近欧氏距离关联锁定 ID 不变
+  2. 多目标 ID 飘移导致甩头 → 中心距离 + IoU 加权关联锁定 ID 不变
 
 【核心设计】
   - 恒定速度卡尔曼滤波器（Kalman Filter × 8状态：cx, cy, w, h, vx, vy, vw, vh）
-  - 最邻近贪婪关联，阈值 200px 内视为同一目标
+  - 最邻近贪婪关联（中心距离 + IoU 加权代价），提高交叉/靠近时的 ID 稳定性
   - 死区预测（Coast/Predict）：连续丢失 ≤ max_lost_frames 帧时用滤波器预测值
   - 超过 max_lost_frames → 释放轨道，对外判丢失
 
@@ -297,8 +297,10 @@ class TargetTracker:
       | 参数 | 默认值 | 说明 |
       |------|--------|------|
       | max_lost_frames | 8 | 目标连续消失帧数上限（~250ms @ 30fps） |
-      | max_association_dist | 200 | 关联距离阈值（像素），超过视为新目标 |
+      | max_association_dist | 200 | 中心距离软阈值（像素），用于归一化代价 |
       | min_hits | 3 | 新轨道确认前需要连续匹配帧数 |
+      | dist_weight | 0.5 | 关联代价中中心距离的权重 |
+      | iou_weight | 0.5 | 关联代价中 (1-IoU) 的权重 |
 
     update() 返回值:
       {
@@ -322,16 +324,20 @@ class TargetTracker:
     """
 
     def __init__(self, max_lost_frames=8, max_association_dist=200.0,
-                 min_hits=3):
+                 min_hits=3, dist_weight=0.5, iou_weight=0.5):
         """
         Args:
-            max_lost_frames:     最大连续丢失帧数（默认 8 ≈ 250-300ms）
-            max_association_dist:关联距离阈值（像素，默认 200px）
-            min_hits:            新轨道确认前最少连续匹配帧数（默认 3）
+            max_lost_frames:      最大连续丢失帧数（默认 8 ≈ 250-300ms）
+            max_association_dist: 中心距离软阈值（像素，默认 200px），用于归一化
+            min_hits:             新轨道确认前最少连续匹配帧数（默认 3）
+            dist_weight:          关联代价中中心距离项的权重（默认 0.5）
+            iou_weight:           关联代价中 (1 - IoU) 项的权重（默认 0.5）
         """
         self.max_lost_frames = max_lost_frames
         self.max_association_dist = max_association_dist
         self.min_hits = min_hits
+        self.dist_weight = dist_weight
+        self.iou_weight = iou_weight
 
         self._next_id = 0
         self._tracks = {}         # {track_id: _Tracklet}
@@ -469,9 +475,52 @@ class TargetTracker:
     #  内部方法
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _iou(box_a, box_b):
+        """
+        计算两个轴对齐框的 IoU
+
+        Args:
+            box_a, box_b: [x1, y1, x2, y2]
+
+        Returns:
+            float — IoU ∈ [0, 1]
+        """
+        if box_a is None or box_b is None:
+            return 0.0
+
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+
+        inter_x1 = max(ax1, bx1)
+        inter_y1 = max(ay1, by1)
+        inter_x2 = min(ax2, bx2)
+        inter_y2 = min(ay2, by2)
+
+        inter_w = max(0.0, inter_x2 - inter_x1)
+        inter_h = max(0.0, inter_y2 - inter_y1)
+        inter_area = inter_w * inter_h
+
+        if inter_area <= 0.0:
+            return 0.0
+
+        area_a = max(0.0, (ax2 - ax1) * (ay2 - ay1))
+        area_b = max(0.0, (bx2 - bx1) * (by2 - by1))
+        union = area_a + area_b - inter_area
+
+        if union <= 0.0:
+            return 0.0
+        return inter_area / union
+
     def _associate(self, det_centers):
         """
-        最邻近贪婪关联
+        中心距离 + IoU 加权的贪婪关联
+
+        代价公式：
+            cost = dist_weight * (center_dist / max_association_dist)
+                 + iou_weight  * (1 - IoU)
+
+        仅当 cost < 1.0 时才视为有效匹配。
 
         Args:
             det_centers: [(idx, cx, cy, w, h, conf, cls_id), ...]
@@ -482,37 +531,48 @@ class TargetTracker:
         if not self._tracks or not det_centers:
             return [], list(self._tracks.keys()), list(range(len(det_centers)))
 
-        # 提取所有轨道的预测位置
-        track_preds = {}  # {tid: (cx, cy)}
-        for tid, track in self._tracks.items():
-            cx, cy = track.last_center
-            track_preds[tid] = (cx, cy)
+        # 预先计算每个检测的框
+        det_boxes = []
+        for _, cx, cy, w, h, _, _ in det_centers:
+            det_boxes.append([cx - w / 2.0, cy - h / 2.0,
+                              cx + w / 2.0, cy + h / 2.0])
 
-        # 贪婪匹配：每条轨道找最近的未分配检测
         matches = []
         assigned_dets = set()
         assigned_tracks = set()
 
-        # 先将轨道按置信度排序（更可靠的轨道优先匹配）
+        # 置信度高的轨道优先匹配
         sorted_tracks = sorted(
             self._tracks.items(),
             key=lambda kv: kv[1].confidence,
             reverse=True
         )
 
+        max_dist = max(self.max_association_dist, 1e-3)
+
         for tid, track in sorted_tracks:
             if tid in assigned_tracks:
                 continue
-            pred_cx, pred_cy = track_preds[tid]
 
-            best_dist = self.max_association_dist
+            pred_cx, pred_cy = track.last_center
+            pred_box = track.last_box
+
+            best_cost = 1.0
             best_did = None
+
             for did, _, d_cx, d_cy, _, _, _ in det_centers:
                 if did in assigned_dets:
                     continue
+
                 dist = np.hypot(pred_cx - d_cx, pred_cy - d_cy)
-                if dist < best_dist:
-                    best_dist = dist
+                norm_dist = dist / max_dist
+                iou_val = self._iou(pred_box, det_boxes[did])
+
+                cost = (self.dist_weight * norm_dist +
+                        self.iou_weight * (1.0 - iou_val))
+
+                if cost < best_cost:
+                    best_cost = cost
                     best_did = did
 
             if best_did is not None:
