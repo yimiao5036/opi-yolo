@@ -3,11 +3,12 @@ target_tracker.py — 轻量级多目标追踪过滤器
 
 【解决的问题】
   1. 目标短暂丢帧（2-5帧）导致无人机抽搐 → 卡尔曼滤波 coast/predict 平滑过渡
-  2. 多目标 ID 飘移导致甩头 → 中心距离 + IoU 加权关联锁定 ID 不变
+  2. 多目标 ID 飘移导致甩头 → 中心距离 + IoU 加权关联 + 主目标锁定
 
 【核心设计】
   - 恒定速度卡尔曼滤波器（Kalman Filter × 8状态：cx, cy, w, h, vx, vy, vw, vh）
   - 最邻近贪婪关联（中心距离 + IoU 加权代价），提高交叉/靠近时的 ID 稳定性
+  - 主目标锁定：一旦选定 primary_id，只要该轨道还活着就持续锁定，避免被新高置信度目标抢走
   - 死区预测（Coast/Predict）：连续丢失 ≤ max_lost_frames 帧时用滤波器预测值
   - 超过 max_lost_frames → 释放轨道，对外判丢失
 
@@ -289,7 +290,8 @@ class TargetTracker:
 
     职责：
       - 接收每帧原始 YOLO 检测列表
-      - 通过卡尔曼滤波 + 最邻近关联维持稳定目标ID
+      - 通过卡尔曼滤波 + 中心距离/IoU 关联维持稳定目标ID
+      - 主目标一旦锁定就持续跟随，直到该轨道真正死亡才重新选择
       - 提供平滑后的目标框 / 中心点供 PID 控制使用
       - 自动回收超过丢失上限的旧轨道
 
@@ -342,6 +344,9 @@ class TargetTracker:
         self._next_id = 0
         self._tracks = {}         # {track_id: _Tracklet}
         self._frame_count = 0
+
+        # 主目标锁定：一旦选定就持续锁定，直到该轨道死亡
+        self._locked_primary_id = None
 
         # 缓存上一帧的 primary 结果（锁外创建副本供控制线程读取）
         self._last_result = {
@@ -398,6 +403,7 @@ class TargetTracker:
             matches = []
             unmatched_tids = list(self._tracks.keys())
             unmatched_dids = []
+            det_centers = []
 
         # ---- 步骤 3：更新匹配的轨道 ----
         for tid, did in matches:
@@ -412,6 +418,9 @@ class TargetTracker:
                 if self._tracks[tid].is_dead:
                     logger.debug("轨道 %d 已死亡 (lost=%d), 回收",
                                  tid, self._tracks[tid].lost_count)
+                    # 如果死的是锁定主目标，清除锁定
+                    if tid == self._locked_primary_id:
+                        self._locked_primary_id = None
                     del self._tracks[tid]
 
         # ---- 步骤 5：未匹配的检测 → 创建新轨道 ----
@@ -430,7 +439,7 @@ class TargetTracker:
             self._tracks[self._next_id] = new_track
             self._next_id += 1
 
-        # ---- 步骤 6：选取主目标（优先级：置信度 > 命中数 > 贴近画面中心） ----
+        # ---- 步骤 6：选取主目标（带锁定逻辑） ----
         result = self._select_primary(frame_shape)
         self._last_result = result
         return result
@@ -444,6 +453,7 @@ class TargetTracker:
         self._tracks.clear()
         self._next_id = 0
         self._frame_count = 0
+        self._locked_primary_id = None
         self._last_result = {
             "tracked": False,
             "primary_id": None,
@@ -587,9 +597,13 @@ class TargetTracker:
 
     def _select_primary(self, frame_shape=None):
         """
-        从活跃轨道中选出主目标
+        从活跃轨道中选出主目标（带锁定）
 
-        优先级：
+        锁定逻辑：
+          1. 如果已有 _locked_primary_id，且该轨道仍存在 → 直接继续用它
+          2. 只有锁定目标真正消失（被回收）后，才重新按优先级选新主目标并锁定
+
+        新选主目标时的优先级：
           1. 含有实测（非 coasting）且确认（hits ≥ min_hits）
           2. 实测轨道中置信度最高
           3. 若无实测轨道，取 coast 中最接近画面中心的
@@ -598,6 +612,7 @@ class TargetTracker:
             dict — 与 update() 返回值格式一致
         """
         if not self._tracks:
+            self._locked_primary_id = None
             return {
                 "tracked": False,
                 "primary_id": None,
@@ -610,28 +625,47 @@ class TargetTracker:
                 "raw": None,
             }
 
-        # 分组：实测轨道 vs coasting 轨道
+        # ---------- 优先使用已锁定的主目标 ----------
+        if self._locked_primary_id is not None and self._locked_primary_id in self._tracks:
+            track = self._tracks[self._locked_primary_id]
+            cx, cy = track.last_center
+            box = track.last_box
+            conf = track.confidence
+            lost = track.lost_count
+            is_predicted = track.lost_count > 0
+
+            return {
+                "tracked": True,
+                "primary_id": self._locked_primary_id,
+                "center": (float(cx), float(cy)),
+                "box": box,
+                "confidence": float(conf),
+                "is_predicted": is_predicted,
+                "lost_frames": lost,
+                "n_active": len(self._tracks),
+                "raw": (None if is_predicted else box),
+            }
+
+        # ---------- 没有锁定目标，或锁定目标已死 → 重新选择 ----------
         measured = []
         coasting = []
 
         for tid, track in self._tracks.items():
             entry = (tid, track)
-            if track.lost_count == 0 and track.hits >= self.min_hits:
-                measured.append(entry)
-            elif track.lost_count == 0:
-                # hits < min_hits 尚未确认，视为暂态
+            if track.lost_count == 0:
                 measured.append(entry)
             else:
                 coasting.append(entry)
 
-        # 优先从实测轨道选
         chosen = None
         is_predicted = False
 
         if measured:
-            # 置信度最高的实测轨道
-            measured.sort(key=lambda kv: kv[1].confidence, reverse=True)
-            chosen = measured[0]
+            # 优先选已确认（hits 足够）且置信度最高的
+            confirmed = [e for e in measured if e[1].hits >= self.min_hits]
+            pool = confirmed if confirmed else measured
+            pool.sort(key=lambda kv: kv[1].confidence, reverse=True)
+            chosen = pool[0]
         elif coasting:
             # 无实测时选最靠近画面中心的
             cx_frame = frame_shape[1] / 2.0 if frame_shape else 320.0
@@ -644,6 +678,7 @@ class TargetTracker:
             is_predicted = True
 
         if chosen is None:
+            self._locked_primary_id = None
             return {
                 "tracked": False,
                 "primary_id": None,
@@ -657,6 +692,9 @@ class TargetTracker:
             }
 
         tid, track = chosen
+        # 锁定新主目标
+        self._locked_primary_id = tid
+
         cx, cy = track.last_center
         box = track.last_box
         conf = track.confidence
@@ -678,4 +716,5 @@ class TargetTracker:
         tracks_info = ", ".join(str(t) for t in self._tracks.values())
         return (f"TargetTracker(frame={self._frame_count}, "
                 f"active={len(self._tracks)}, "
+                f"locked={self._locked_primary_id}, "
                 f"tracks=[{tracks_info}])")
